@@ -123,8 +123,7 @@ function ensureCollectionForDir(
   });
 
   if (!listResult.error && listResult.status === 0) {
-    const existingCollections = listResult.stdout.match(/^[a-zA-Z0-9_-]+\s+\(qmd:\/\//gm) ?? [];
-    const collectionNames = existingCollections.map((line) => line.trim().split(/\s/)[0]);
+    const collectionNames = parseCollectionList(listResult.stdout);
 
     for (const collName of collectionNames) {
       if (collName === name) {
@@ -190,20 +189,14 @@ interface QmdError {
 
 function parseCollectionList(stdout: string): string[] {
   // Try JSON format first
-  const jsonResult = spawnSync("qmd", ["collection", "list", "--format", "json"], {
-    encoding: "utf-8",
-    timeout: 5_000,
-  });
-
-  if (!jsonResult.error && jsonResult.status === 0) {
-    try {
-      const parsed = JSON.parse(jsonResult.stdout);
-      if (Array.isArray(parsed)) {
-        return parsed.map((item: any) => item.name ?? item.id ?? String(item)).filter(Boolean);
-      }
-    } catch {
-      // Fall through to regex parsing
+  try {
+    const parsed = JSON.parse(stdout);
+    if (Array.isArray(parsed)) {
+      const names = parsed.map((item: any) => item.name ?? item.id ?? String(item)).filter(Boolean);
+      if (names.length > 0) return names;
     }
+  } catch {
+    // Not JSON — fall through to regex
   }
 
   // Fallback: regex parsing
@@ -493,13 +486,21 @@ function rewriteSkillsBlock(
     return { newPrompt: systemPrompt };
   }
 
-  const rankedNames = result.error ? [] : result.names;
-
   if (result.error) {
     notify(
       `[pi-smart-skills] QMD ${result.error.kind}: ${result.error.detail} — injecting all skills`,
       "warning",
     );
+    return { newPrompt: systemPrompt };
+  }
+
+  const rankedNames = result.names;
+  if (rankedNames.length === 0) {
+    notify(
+      `[pi-smart-skills] QMD returned no results — injecting all skills`,
+      "warning",
+    );
+    return { newPrompt: systemPrompt };
   }
 
   // Filter global skills by ranked names
@@ -561,7 +562,7 @@ export default function (pi: ExtensionAPI) {
     const cwd = ctx.cwd ?? process.cwd();
 
     if (!qmdOk) {
-      ctx.ui.notify("[pi-smart-skills] QMD binary not found — will inject all skills", "warning");
+      ctx.ui?.notify("[pi-smart-skills] QMD binary not found — will inject all skills", "warning");
     }
 
     const collections: SkillCollection[] = [];
@@ -585,21 +586,23 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (collections.length > 0) {
-        ctx.ui.notify(
+        ctx.ui?.notify(
           `[pi-smart-skills] Indexed ${collections.length} skill collection(s): ${collections.map((c) => c.name).join(", ")}`,
           "info",
         );
       }
     }
 
-    const cronTimer = setInterval(() => {
-      for (const coll of collections) {
-        spawnSync("qmd", ["update", coll.name], {
-          encoding: "utf-8",
-          timeout: config.qmdTimeoutMs * 2,
-        });
-      }
-    }, config.cronIntervalMs);
+    const cronTimer = collections.length > 0
+      ? setInterval(() => {
+          for (const coll of collections) {
+            spawnSync("qmd", ["update", coll.name], {
+              encoding: "utf-8",
+              timeout: config.qmdTimeoutMs * 2,
+            });
+          }
+        }, config.cronIntervalMs)
+      : null;
 
     sessionMap.set(ctx, {
       activeCollections: collections,
@@ -629,7 +632,7 @@ export default function (pi: ExtensionAPI) {
     if (!state) return undefined;
 
     const notify: NotifyFn = (msg, level) => {
-      ctx.ui.notify(msg, level);
+      ctx.ui?.notify(msg, level);
     };
 
     try {
