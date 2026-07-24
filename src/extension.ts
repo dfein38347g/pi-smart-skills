@@ -71,19 +71,46 @@ function ensureCollectionForDir(name: string, dirPath: string): boolean {
     return false;
   }
 
-  const listResult = spawnSync("qmd", ["collection", "list", "--json"], {
+  const resolvedDir = fs.realpathSync(dirPath);
+
+  const listResult = spawnSync("qmd", ["collection", "list"], {
     encoding: "utf-8",
     timeout: config.qmdTimeoutMs,
   });
 
   if (!listResult.error && listResult.status === 0) {
-    try {
-      const collections: Array<{ name: string }> = JSON.parse(listResult.stdout);
-      if (Array.isArray(collections) && collections.some((c) => c.name === name)) {
+    const existingCollections = listResult.stdout.match(/^[a-zA-Z0-9_-]+\s+\(qmd:\/\//gm) ?? [];
+    const collectionNames = existingCollections.map((line) => line.trim().split(/\s/)[0]);
+
+    for (const collName of collectionNames) {
+      if (collName === name) {
         return true;
       }
-    } catch {
-      // Parse error — proceed to create collection
+
+      const showResult = spawnSync("qmd", ["collection", "show", collName], {
+        encoding: "utf-8",
+        timeout: config.qmdTimeoutMs,
+      });
+
+      if (showResult.error || showResult.status !== 0) {
+        continue;
+      }
+
+      const pathMatch = showResult.stdout.match(/Path:\s+(.+)/);
+      if (pathMatch) {
+        try {
+          const existingPath = fs.realpathSync(pathMatch[1].trim());
+          if (existingPath === resolvedDir) {
+            spawnSync("qmd", ["collection", "remove", collName], {
+              encoding: "utf-8",
+              timeout: config.qmdTimeoutMs,
+            });
+            break;
+          }
+        } catch {
+          // realpath failed — skip this collection
+        }
+      }
     }
   }
 
