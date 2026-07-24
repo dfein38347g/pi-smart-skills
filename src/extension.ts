@@ -114,7 +114,7 @@ function ensureCollectionForDir(name: string, dirPath: string): boolean {
     }
   }
 
-  const addResult = spawnSync("qmd", ["collection", "add", dirPath, "--name", name], {
+  const addResult = spawnSync("qmd", ["collection", "add", resolvedDir, "--name", name], {
     encoding: "utf-8",
     timeout: config.qmdTimeoutMs,
   });
@@ -225,7 +225,7 @@ function collectionNameForDir(dirPath: string, source: "global" | "project"): st
 function expandTilde(p: string): string {
   if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
   if (p === "~") return os.homedir();
-  return p;
+  return path.resolve(p);
 }
 
 function searchAllCollections(query: string): { names: string[]; error?: QmdError } {
