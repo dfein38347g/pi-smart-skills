@@ -120,7 +120,11 @@ function qmdAvailable(): boolean {
   return !result.error && result.status === 0;
 }
 
-function ensureCollection(): boolean {
+function ensureCollectionForDir(name: string, dirPath: string): boolean {
+  if (!fs.existsSync(dirPath)) {
+    return false;
+  }
+
   const listResult = spawnSync("qmd", ["collection", "list", "--json"], {
     encoding: "utf-8",
     timeout: config.qmdTimeoutMs,
@@ -129,7 +133,7 @@ function ensureCollection(): boolean {
   if (!listResult.error && listResult.status === 0) {
     try {
       const collections: Array<{ name: string }> = JSON.parse(listResult.stdout);
-      if (Array.isArray(collections) && collections.some((c) => c.name === COLLECTION_NAME)) {
+      if (Array.isArray(collections) && collections.some((c) => c.name === name)) {
         return true;
       }
     } catch {
@@ -137,11 +141,7 @@ function ensureCollection(): boolean {
     }
   }
 
-  if (!fs.existsSync(AGENT_SKILLS_DIR)) {
-    return false;
-  }
-
-  const addResult = spawnSync("qmd", ["collection", "add", COLLECTION_NAME, AGENT_SKILLS_DIR], {
+  const addResult = spawnSync("qmd", ["collection", "add", name, dirPath], {
     encoding: "utf-8",
     timeout: config.qmdTimeoutMs,
   });
@@ -436,17 +436,8 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    try {
-      if (!ensureCollection()) {
-        ctx.ui?.notify("[pi-smart-skills] Failed to create QMD collection — will inject all skills", "warn");
-        return;
-      }
-
-      ctx.ui?.notify("[pi-smart-skills] Collection created, performing initial index", "info");
-      updateIndex();
-    } catch (err) {
-      ctx.ui?.notify(`[pi-smart-skills] Init error: ${err} — will inject all skills`, "warn");
-    }
+    // Collection setup will be handled by ensureAllCollections (Task 4)
+    updateIndex();
   });
 
   if (!initialized) {
