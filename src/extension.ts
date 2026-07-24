@@ -18,17 +18,15 @@ interface ExtensionConfig {
   promptCharLimit: number;
   stabilityWindow: number;
   qmdTimeoutMs: number;
-  cacheTtlMs: number;
   cronIntervalMs: number;
   skillDirectories: string[];
 }
 
 const DEFAULT_CONFIG: ExtensionConfig = {
   maxResults: 10,
-  promptCharLimit: 60_000,
-  stabilityWindow: 3,
+  promptCharLimit: 4000,
+  stabilityWindow: 5,
   qmdTimeoutMs: 5_000,
-  cacheTtlMs: 60_000,
   cronIntervalMs: 5 * 60 * 1_000,
   skillDirectories: [path.join(os.homedir(), ".pi", "agent", "skills")],
 };
@@ -42,8 +40,6 @@ function loadConfig(): ExtensionConfig {
   }
 }
 
-const config = loadConfig();
-
 /* ------------------------------------------------------------------ */
 /* Skill types                                                        */
 /* ------------------------------------------------------------------ */
@@ -52,6 +48,50 @@ interface DiscoveredSkill {
   name: string;
   description: string;
   location: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-session state                                                  */
+/* ------------------------------------------------------------------ */
+
+interface CacheEntry {
+  rankedNames: string[];
+  topNSet: Set<string>;
+}
+
+interface SessionState {
+  activeCollections: SkillCollection[];
+  searchCache: CacheEntry | null;
+  config: ExtensionConfig;
+  qmdOk: boolean;
+  cronTimer: ReturnType<typeof setInterval> | null;
+  cwd: string;
+}
+
+const sessionMap = new Map<object, SessionState>();
+
+interface SkillCollection {
+  name: string;
+  dirPath: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Path helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+function expandTilde(p: string, baseDir?: string): string {
+  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  if (p === "~") return os.homedir();
+  return path.resolve(baseDir ?? process.cwd(), p);
+}
+
+function collectionNameForDir(dirPath: string): string {
+  const resolved = fs.realpathSync(dirPath);
+  const segments = resolved.split(path.sep).filter(Boolean);
+  const sanitized = segments.map((seg) =>
+    seg.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-")
+  ).join("-");
+  return `pi-smart-skills-${sanitized.slice(0, 60)}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -66,9 +106,13 @@ function qmdAvailable(): boolean {
   return !result.error && result.status === 0;
 }
 
-function ensureCollectionForDir(name: string, dirPath: string): boolean {
+function ensureCollectionForDir(
+  name: string,
+  dirPath: string,
+  config: ExtensionConfig,
+): { ok: boolean; stderr?: string } {
   if (!fs.existsSync(dirPath)) {
-    return false;
+    return { ok: false };
   }
 
   const resolvedDir = fs.realpathSync(dirPath);
@@ -84,7 +128,7 @@ function ensureCollectionForDir(name: string, dirPath: string): boolean {
 
     for (const collName of collectionNames) {
       if (collName === name) {
-        return true;
+        return { ok: true };
       }
 
       const showResult = spawnSync("qmd", ["collection", "show", collName], {
@@ -120,7 +164,9 @@ function ensureCollectionForDir(name: string, dirPath: string): boolean {
   });
 
   if (addResult.error || addResult.status !== 0) {
-    return false;
+    const stderr = addResult.stderr?.trim() ?? "";
+    console.warn(`[pi-smart-skills] Failed to add collection "${name}": ${stderr}`);
+    return { ok: false, stderr };
   }
 
   const updateResult = spawnSync("qmd", ["update"], {
@@ -128,15 +174,13 @@ function ensureCollectionForDir(name: string, dirPath: string): boolean {
     timeout: config.qmdTimeoutMs * 2,
   });
 
-  return !updateResult.error && updateResult.status === 0;
-}
+  if (updateResult.error || updateResult.status !== 0) {
+    const stderr = updateResult.stderr?.trim() ?? "";
+    console.warn(`[pi-smart-skills] Failed to update collection "${name}": ${stderr}`);
+    return { ok: false, stderr };
+  }
 
-function updateIndex(): boolean {
-  const result = spawnSync("qmd", ["update"], {
-    encoding: "utf-8",
-    timeout: config.qmdTimeoutMs * 2,
-  });
-  return !result.error && result.status === 0;
+  return { ok: true };
 }
 
 interface QmdError {
@@ -144,7 +188,40 @@ interface QmdError {
   detail: string;
 }
 
-function searchQMD(collectionName: string, query: string): { names: string[]; error?: QmdError } {
+function parseCollectionList(stdout: string): string[] {
+  // Try JSON format first
+  const jsonResult = spawnSync("qmd", ["collection", "list", "--format", "json"], {
+    encoding: "utf-8",
+    timeout: 5_000,
+  });
+
+  if (!jsonResult.error && jsonResult.status === 0) {
+    try {
+      const parsed = JSON.parse(jsonResult.stdout);
+      if (Array.isArray(parsed)) {
+        return parsed.map((item: any) => item.name ?? item.id ?? String(item)).filter(Boolean);
+      }
+    } catch {
+      // Fall through to regex parsing
+    }
+  }
+
+  // Fallback: regex parsing
+  const matches = stdout.match(/^[a-zA-Z0-9_-]+\s+\(qmd:\/\//gm) ?? [];
+  const names = matches.map((line) => line.trim().split(/\s/)[0]);
+
+  if (names.length === 0) {
+    console.warn("[pi-smart-skills] QMD collection list regex matched zero lines — output may have changed format");
+  }
+
+  return names;
+}
+
+function searchQMD(
+  collectionName: string,
+  query: string,
+  config: ExtensionConfig,
+): { names: string[]; error?: QmdError } {
   const result = spawnSync(
     "qmd",
     ["query", collectionName, query, "-n", String(config.maxResults), "--format", "json"],
@@ -157,12 +234,12 @@ function searchQMD(collectionName: string, query: string): { names: string[]; er
   if (result.error) {
     return { names: [], error: { kind: "spawn", detail: result.error.message } };
   }
+  if (result.status === 124 || result.signal === "SIGTERM") {
+    return { names: [], error: { kind: "timeout", detail: `qmd query timed out after ${config.qmdTimeoutMs}ms` } };
+  }
   if (result.status !== 0) {
-    const stderr = result.stderr?.toString().trim() ?? "";
-    return {
-      names: [],
-      error: { kind: "exit", detail: `exit ${result.status}${stderr ? ": " + stderr : ""}` },
-    };
+    const stderr = result.stderr?.trim() ?? "";
+    return { names: [], error: { kind: "exit", detail: `exit ${result.status}${stderr ? ": " + stderr : ""}` } };
   }
 
   let parsed: unknown;
@@ -196,50 +273,110 @@ function searchQMD(collectionName: string, query: string): { names: string[]; er
 }
 
 /* ------------------------------------------------------------------ */
-/* Search cache with TTL + stability tracking                         */
+/* Project skills filesystem discovery                                */
 /* ------------------------------------------------------------------ */
 
-interface CacheEntry {
-  rankedNames: string[];
-  topNSet: Set<string>;
-  injectedPrompt: string;
-  timestamp: number;
+function discoverProjectSkills(cwd: string, notify: NotifyFn): DiscoveredSkill[] {
+  const projectSkillsDir = path.join(cwd, ".pi", "skills");
+  if (!fs.existsSync(projectSkillsDir) || !fs.statSync(projectSkillsDir).isDirectory()) {
+    return [];
+  }
+
+  const skills: DiscoveredSkill[] = [];
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(projectSkillsDir, { withFileTypes: true });
+  } catch {
+    notify("[pi-smart-skills] Failed to read project skills directory", "warning");
+    return [];
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+
+    const skillMdPath = path.join(projectSkillsDir, entry.name, "SKILL.md");
+    if (!fs.existsSync(skillMdPath)) continue;
+
+    let content: string;
+    try {
+      content = fs.readFileSync(skillMdPath, "utf-8");
+    } catch {
+      notify(`[pi-smart-skills] Failed to read ${skillMdPath}`, "warning");
+      continue;
+    }
+
+    const skill = parseSkillFile(content, skillMdPath);
+    if (skill) {
+      skills.push(skill);
+    } else {
+      notify(`[pi-smart-skills] Skipping malformed skill file: ${skillMdPath}`, "warning");
+    }
+  }
+
+  return skills;
 }
 
-let searchCache: CacheEntry | null = null;
+function parseSkillFile(content: string, filePath: string): DiscoveredSkill | null {
+  // Try YAML frontmatter first
+  const yamlMatch = content.match(/^---\n([\s\S]*?)\n---/);
+  if (yamlMatch) {
+    const yamlBlock = yamlMatch[1];
+    const nameMatch = yamlBlock.match(/^name:\s*(.+)$/m);
+    const descMatch = yamlBlock.match(/^description:\s*(.+)$/m);
+    if (nameMatch && descMatch) {
+      return {
+        name: nameMatch[1].trim(),
+        description: descMatch[1].trim(),
+        location: filePath,
+      };
+    }
+  }
 
-interface SkillCollection {
-  name: string;
-  dirPath: string;
-  source: 'global' | 'project';
+  // Try instructions/frontmatter block with name/description fields
+  const instNameMatch = content.match(/^---\nname:\s*(.+)$/m);
+  const instDescMatch = content.match(/^description:\s*(.+)$/m);
+  if (instNameMatch && instDescMatch) {
+    return {
+      name: instNameMatch[1].trim(),
+      description: instDescMatch[1].trim(),
+      location: filePath,
+    };
+  }
+
+  // Try XML-like tags in the content
+  const nameTag = content.match(/<name>(.*?)<\/name>/s);
+  const descTag = content.match(/<description>(.*?)<\/description>/s);
+  if (nameTag && descTag) {
+    return {
+      name: decodeXml(nameTag[1].trim()),
+      description: decodeXml(descTag[1].trim()),
+      location: filePath,
+    };
+  }
+
+  return null;
 }
 
-let activeCollections: SkillCollection[] = [];
+/* ------------------------------------------------------------------ */
+/* Search across collections                                          */
+/* ------------------------------------------------------------------ */
 
-function collectionNameForDir(dirPath: string, source: "global" | "project"): string {
-  if (source === "global") return "pi-smart-skills-global";
-  const sanitized = dirPath.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").slice(0, 60);
-  return `pi-smart-skills-proj-${sanitized}`;
-}
-
-function expandTilde(p: string): string {
-  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
-  if (p === "~") return os.homedir();
-  return path.resolve(p);
-}
-
-function searchAllCollections(query: string): { names: string[]; error?: QmdError } {
-  if (activeCollections.length === 0) {
+function searchAllCollections(
+  collections: SkillCollection[],
+  query: string,
+  config: ExtensionConfig,
+): { names: string[]; error?: QmdError } {
+  if (collections.length === 0) {
     return { names: [], error: { kind: "empty", detail: "no active collections" } };
   }
 
   const nameRank = new Map<string, number>();
   let firstError: QmdError | undefined;
 
-  for (let idx = 0; idx < activeCollections.length; idx++) {
-    const coll = activeCollections[idx];
+  for (const coll of collections) {
     try {
-      const result = searchQMD(coll.name, query);
+      const result = searchQMD(coll.name, query, config);
       if (result.error) {
         if (!firstError) firstError = result.error;
         continue;
@@ -319,164 +456,168 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
   return true;
 }
 
-type NotifyFn = (msg: string, level: "info" | "warn" | "error") => void;
+type NotifyFn = (msg: string, level: "info" | "warning" | "error") => void;
 
 function rewriteSkillsBlock(
   systemPrompt: string,
   userPrompt: string,
+  state: SessionState,
   notify: NotifyFn,
 ): { newPrompt: string } | null {
   const blockMatch = systemPrompt.match(/<available_skills>[\s\S]*?<\/available_skills>/);
   if (!blockMatch) return null;
 
   const fullBlock = blockMatch[0];
-  const allSkills = parseSkillEntries(fullBlock);
+  const allGlobalSkills = parseSkillEntries(fullBlock);
 
-  if (userPrompt.length > config.promptCharLimit) {
+  // Discover project skills from filesystem
+  const projectSkills = discoverProjectSkills(state.cwd, notify);
+
+  if (userPrompt.length > state.config.promptCharLimit) {
     notify(
-      `[pi-smart-skills] Prompt too long (${userPrompt.length} chars) — injecting all ${allSkills.length} skills`,
+      `[pi-smart-skills] Prompt too long (${userPrompt.length} chars) — injecting all skills`,
       "info",
     );
     return { newPrompt: systemPrompt };
   }
 
+  // Search global collections via QMD
   let result: { names: string[]; error?: QmdError };
   try {
-    result = searchAllCollections(userPrompt);
+    result = searchAllCollections(state.activeCollections, userPrompt, state.config);
   } catch (err) {
     notify(
-      `[pi-smart-skills] QMD search error: ${err} — injecting all ${allSkills.length} skills`,
-      "warn",
+      `[pi-smart-skills] QMD search error: ${err} — injecting all skills`,
+      "warning",
     );
     return { newPrompt: systemPrompt };
   }
+
+  const rankedNames = result.error ? [] : result.names;
 
   if (result.error) {
     notify(
-      `[pi-smart-skills] QMD ${result.error.kind}: ${result.error.detail} — injecting all ${allSkills.length} skills`,
-      "warn",
+      `[pi-smart-skills] QMD ${result.error.kind}: ${result.error.detail} — injecting all skills`,
+      "warning",
     );
-    return { newPrompt: systemPrompt };
   }
 
-  const rankedNames = result.names;
-  if (rankedNames.length === 0) {
-    notify(
-      `[pi-smart-skills] QMD returned no results — injecting all ${allSkills.length} skills`,
-      "warn",
-    );
-    return { newPrompt: systemPrompt };
-  }
-
+  // Filter global skills by ranked names
   const nameSet = new Set(rankedNames);
-  const filtered = allSkills.filter((s) => nameSet.has(s.name));
+  const filteredGlobal = allGlobalSkills.filter((s) => nameSet.has(s.name));
 
-  if (filtered.length === 0) {
+  // Combine: project skills first, then filtered global skills
+  const combinedSkills = [...projectSkills, ...filteredGlobal];
+
+  if (combinedSkills.length === 0 && allGlobalSkills.length > 0) {
     notify(
-      `[pi-smart-skills] No ranked skills matched — injecting all ${allSkills.length} skills`,
-      "warn",
+      `[pi-smart-skills] No ranked skills matched — injecting all ${allGlobalSkills.length} skills`,
+      "warning",
     );
     return { newPrompt: systemPrompt };
   }
 
-  const newTopNSet = new Set(rankedNames.slice(0, config.stabilityWindow));
-  if (searchCache && searchCache.topNSet.size > 0) {
-    if (setsEqual(newTopNSet, searchCache.topNSet)) {
-      return { newPrompt: searchCache.injectedPrompt };
+  // Stability cache check — only against global ranked names (project skills are always included)
+  const newTopNSet = new Set(rankedNames.slice(0, state.config.stabilityWindow));
+  const cache = state.searchCache;
+  if (cache && cache.topNSet.size > 0) {
+    if (setsEqual(newTopNSet, cache.topNSet)) {
+      // Rebuild prompt from cached ranked names + current system prompt
+      const cachedFiltered = allGlobalSkills.filter((s) =>
+        cache.rankedNames.includes(s.name)
+      );
+      const rebuiltSkills = [...projectSkills, ...cachedFiltered];
+      const newBlock = buildSkillsBlock(rebuiltSkills);
+      return { newPrompt: systemPrompt.replace(fullBlock, newBlock) };
     }
   }
 
-  const newBlock = buildSkillsBlock(filtered);
+  const newBlock = buildSkillsBlock(combinedSkills);
   const newPrompt = systemPrompt.replace(fullBlock, newBlock);
 
-  searchCache = {
+  state.searchCache = {
     rankedNames,
     topNSet: newTopNSet,
-    injectedPrompt: newPrompt,
-    timestamp: Date.now(),
   };
 
+  const totalInjected = combinedSkills.length;
+  const totalAvailable = projectSkills.length + allGlobalSkills.length;
   notify(
-    `[pi-smart-skills] Injected ${filtered.length}/${allSkills.length} skills (top-${config.stabilityWindow}: ${[...newTopNSet].join(", ")})`,
+    `[pi-smart-skills] Injected ${totalInjected}/${totalAvailable} skills (${projectSkills.length} project, top-${state.config.stabilityWindow}: ${[...newTopNSet].join(", ")})`,
     "info",
   );
+
   return { newPrompt };
 }
 
 /* ------------------------------------------------------------------ */
-/* Extension factory                                                  */
+/* Extension entry point                                              */
 /* ------------------------------------------------------------------ */
 
-let initialized = false;
-let cronTimer: ReturnType<typeof setInterval> | null = null;
-
 export default function (pi: ExtensionAPI) {
-  const qmdOk = qmdAvailable();
-
-  if (!qmdOk) {
-    console.warn("[pi-smart-skills] QMD not available — extension will use all-skills failover");
-  }
-
   pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
-    searchCache = null;
-    activeCollections = [];
+    const config = loadConfig();
+    const qmdOk = qmdAvailable();
+    const cwd = ctx.cwd ?? process.cwd();
 
     if (!qmdOk) {
-      ctx.ui?.notify("[pi-smart-skills] QMD binary not found — will inject all skills", "warn");
-      return;
+      ctx.ui.notify("[pi-smart-skills] QMD binary not found — will inject all skills", "warning");
     }
 
-    let initOk = false;
+    const collections: SkillCollection[] = [];
 
-    try {
+    if (qmdOk) {
       for (const dir of config.skillDirectories) {
-        const resolved = expandTilde(dir);
+        const resolved = expandTilde(dir, cwd);
         if (!fs.existsSync(resolved)) continue;
 
-        const name = collectionNameForDir(resolved, "global");
-        if (ensureCollectionForDir(name, resolved)) {
-          activeCollections.push({ name, dirPath: resolved, source: "global" });
-          initOk = true;
+        let name: string;
+        try {
+          name = collectionNameForDir(resolved);
+        } catch {
+          continue;
+        }
+
+        const res = ensureCollectionForDir(name, resolved, config);
+        if (res.ok) {
+          collections.push({ name, dirPath: resolved });
         }
       }
 
-      const cwd = ctx.cwd ?? process.cwd();
-      const projectSkillsDir = path.join(cwd, ".pi", "skills");
-      if (fs.existsSync(projectSkillsDir)) {
-        const name = collectionNameForDir(projectSkillsDir, "project");
-        if (ensureCollectionForDir(name, projectSkillsDir)) {
-          activeCollections.push({ name, dirPath: projectSkillsDir, source: "project" });
-          initOk = true;
-        }
-      }
-
-      if (initOk) {
-        ctx.ui?.notify(
-          `[pi-smart-skills] Indexed ${activeCollections.length} skill collection(s): ${activeCollections.map(c => c.name).join(", ")}`,
+      if (collections.length > 0) {
+        ctx.ui.notify(
+          `[pi-smart-skills] Indexed ${collections.length} skill collection(s): ${collections.map((c) => c.name).join(", ")}`,
           "info",
         );
-      } else {
-        ctx.ui?.notify("[pi-smart-skills] No skill directories found — will inject all skills", "warn");
       }
-    } catch (err) {
-      ctx.ui?.notify(`[pi-smart-skills] Init error: ${err} — will inject all skills`, "warn");
     }
 
-    if (cronTimer) clearInterval(cronTimer);
-    cronTimer = setInterval(() => {
-      for (const coll of activeCollections) {
+    const cronTimer = setInterval(() => {
+      for (const coll of collections) {
         spawnSync("qmd", ["update", coll.name], {
           encoding: "utf-8",
           timeout: config.qmdTimeoutMs * 2,
         });
       }
     }, config.cronIntervalMs);
+
+    sessionMap.set(ctx, {
+      activeCollections: collections,
+      searchCache: null,
+      config,
+      qmdOk,
+      cronTimer,
+      cwd,
+    });
   });
 
-  pi.on("session_end", async () => {
-    if (cronTimer) {
-      clearInterval(cronTimer);
-      cronTimer = null;
+  pi.on("session_shutdown", async (_event: any, ctx: ExtensionContext) => {
+    const state = sessionMap.get(ctx);
+    if (state) {
+      if (state.cronTimer) {
+        clearInterval(state.cronTimer);
+      }
+      sessionMap.delete(ctx);
     }
   });
 
@@ -484,18 +625,22 @@ export default function (pi: ExtensionAPI) {
     const sp = event.systemPrompt;
     if (!sp || typeof sp !== "string") return undefined;
 
+    const state = sessionMap.get(ctx);
+    if (!state) return undefined;
+
     const notify: NotifyFn = (msg, level) => {
-      ctx.ui?.notify(msg, level);
+      ctx.ui.notify(msg, level);
     };
 
     try {
       const userPrompt = event.prompt ?? "";
-      const result = rewriteSkillsBlock(sp, userPrompt, notify);
+      const result = rewriteSkillsBlock(sp, userPrompt, state, notify);
       if (result && result.newPrompt !== sp) {
         return { systemPrompt: result.newPrompt };
       }
     } catch (err) {
-      notify(`[pi-smart-skills] Error: ${err} — injecting all skills`, "error");
+      notify(`[pi-smart-skills] Error: ${err}`, "error");
+      return { systemPrompt: sp };
     }
     return undefined;
   });
