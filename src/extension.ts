@@ -87,7 +87,7 @@ function ensureCollectionForDir(name: string, dirPath: string): boolean {
     }
   }
 
-  const addResult = spawnSync("qmd", ["collection", "add", name, dirPath], {
+  const addResult = spawnSync("qmd", ["collection", "add", dirPath, "--name", name], {
     encoding: "utf-8",
     timeout: config.qmdTimeoutMs,
   });
