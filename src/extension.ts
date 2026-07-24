@@ -45,67 +45,13 @@ function loadConfig(): ExtensionConfig {
 const config = loadConfig();
 
 /* ------------------------------------------------------------------ */
-/* Constants                                                          */
-/* ------------------------------------------------------------------ */
-
-const COLLECTION_NAME = "pi-smart-skills";
-const AGENT_SKILLS_DIR = path.join(os.homedir(), ".pi", "agent", "skills");
-
-/* ------------------------------------------------------------------ */
-/* Skill discovery                                                    */
+/* Skill types                                                        */
 /* ------------------------------------------------------------------ */
 
 interface DiscoveredSkill {
   name: string;
   description: string;
   location: string;
-}
-
-function discoverSkills(): DiscoveredSkill[] {
-  const skills: DiscoveredSkill[] = [];
-  if (!fs.existsSync(AGENT_SKILLS_DIR) || !fs.statSync(AGENT_SKILLS_DIR).isDirectory()) {
-    return skills;
-  }
-
-  try {
-    const entries = fs.readdirSync(AGENT_SKILLS_DIR);
-    for (const entry of entries) {
-      const skillMdPath = path.join(AGENT_SKILLS_DIR, entry, "SKILL.md");
-      if (!fs.existsSync(skillMdPath)) continue;
-      try {
-        const content = fs.readFileSync(skillMdPath, "utf-8");
-        skills.push({
-          name: entry,
-          description: extractDescription(content),
-          location: skillMdPath,
-        });
-      } catch {
-        // Skip unreadable files
-      }
-    }
-  } catch {
-    // Skip unreadable directory
-  }
-
-  return skills;
-}
-
-function extractDescription(content: string): string {
-  const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-  if (frontmatterMatch) {
-    const descMatch = frontmatterMatch[1].match(/^description:\s*\|?\s*(.+?)\s*$/m);
-    if (descMatch) return descMatch[1].trim();
-  }
-
-  const lines = content.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith("#")) {
-      return trimmed.replace(/^#+\s*/, "").trim();
-    }
-  }
-
-  return "";
 }
 
 /* ------------------------------------------------------------------ */
@@ -253,24 +199,6 @@ function expandTilde(p: string): string {
   if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
   if (p === "~") return os.homedir();
   return p;
-}
-
-function getCachedOrSearch(query: string): { names: string[]; error?: QmdError } {
-  if (searchCache && Date.now() - searchCache.timestamp < config.cacheTtlMs) {
-    return { names: searchCache.rankedNames };
-  }
-
-  const result = searchQMD("pi-smart-skills", query);
-  if (result.names.length > 0) {
-    searchCache = {
-      rankedNames: result.names,
-      topNSet: new Set(result.names.slice(0, config.stabilityWindow)),
-      injectedPrompt: "",
-      timestamp: Date.now(),
-    };
-  }
-
-  return { names: searchCache?.rankedNames ?? [], error: result.error };
 }
 
 function searchAllCollections(query: string): { names: string[]; error?: QmdError } {
