@@ -269,7 +269,41 @@ function getCachedOrSearch(query: string): { names: string[]; error?: QmdError }
       timestamp: Date.now(),
     };
   }
-  return result;
+
+  return { names: searchCache?.rankedNames ?? [], error: result.error };
+}
+
+function searchAllCollections(query: string): { names: string[]; error?: QmdError } {
+  if (activeCollections.length === 0) {
+    return { names: [], error: { kind: "empty", detail: "no active collections" } };
+  }
+
+  const nameRank = new Map<string, number>();
+  let firstError: QmdError | undefined;
+
+  for (let idx = 0; idx < activeCollections.length; idx++) {
+    const coll = activeCollections[idx];
+    try {
+      const result = searchQMD(coll.name, query);
+      if (result.error) {
+        if (!firstError) firstError = result.error;
+        continue;
+      }
+
+      for (let i = 0; i < result.names.length; i++) {
+        const name = result.names[i];
+        const current = nameRank.get(name);
+        if (current === undefined || i < current) {
+          nameRank.set(name, i);
+        }
+      }
+    } catch {
+      if (!firstError) firstError = { kind: "spawn", detail: "unexpected error during search" };
+    }
+  }
+
+  const ranked = [...nameRank.entries()].sort((a, b) => a[1] - b[1]);
+  return { names: ranked.map(([name]) => name), error: firstError };
 }
 
 /* ------------------------------------------------------------------ */
@@ -353,7 +387,7 @@ function rewriteSkillsBlock(
 
   let result: { names: string[]; error?: QmdError };
   try {
-    result = getCachedOrSearch(userPrompt);
+    result = searchAllCollections(userPrompt);
   } catch (err) {
     notify(
       `[pi-smart-skills] QMD search error: ${err} — injecting all ${allSkills.length} skills`,
