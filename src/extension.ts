@@ -464,31 +464,59 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
     searchCache = null;
+    activeCollections = [];
 
     if (!qmdOk) {
       ctx.ui?.notify("[pi-smart-skills] QMD binary not found — will inject all skills", "warn");
       return;
     }
 
-    // Collection setup will be handled by ensureAllCollections (Task 4)
-    updateIndex();
-  });
+    let initOk = false;
 
-  if (!initialized) {
-    initialized = true;
-    cronTimer = setInterval(() => {
-      try {
-        if (qmdOk) {
-          updateIndex();
+    try {
+      for (const dir of config.skillDirectories) {
+        const resolved = expandTilde(dir);
+        if (!fs.existsSync(resolved)) continue;
+
+        const name = collectionNameForDir(resolved, "global");
+        if (ensureCollectionForDir(name, resolved)) {
+          activeCollections.push({ name, dirPath: resolved, source: "global" });
+          initOk = true;
         }
-      } catch (err) {
-        console.warn("[pi-smart-skills] background index error:", err);
+      }
+
+      const cwd = ctx.cwd ?? process.cwd();
+      const projectSkillsDir = path.join(cwd, ".pi", "skills");
+      if (fs.existsSync(projectSkillsDir)) {
+        const name = collectionNameForDir(projectSkillsDir, "project");
+        if (ensureCollectionForDir(name, projectSkillsDir)) {
+          activeCollections.push({ name, dirPath: projectSkillsDir, source: "project" });
+          initOk = true;
+        }
+      }
+
+      if (initOk) {
+        ctx.ui?.notify(
+          `[pi-smart-skills] Indexed ${activeCollections.length} skill collection(s): ${activeCollections.map(c => c.name).join(", ")}`,
+          "info",
+        );
+      } else {
+        ctx.ui?.notify("[pi-smart-skills] No skill directories found — will inject all skills", "warn");
+      }
+    } catch (err) {
+      ctx.ui?.notify(`[pi-smart-skills] Init error: ${err} — will inject all skills`, "warn");
+    }
+
+    if (cronTimer) clearInterval(cronTimer);
+    cronTimer = setInterval(() => {
+      for (const coll of activeCollections) {
+        spawnSync("qmd", ["update", coll.name], {
+          encoding: "utf-8",
+          timeout: config.qmdTimeoutMs * 2,
+        });
       }
     }, config.cronIntervalMs);
-    console.log(
-      `[pi-smart-skills] background indexer started (every ${config.cronIntervalMs / 1_000}s)`,
-    );
-  }
+  });
 
   pi.on("session_end", async () => {
     if (cronTimer) {
