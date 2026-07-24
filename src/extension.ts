@@ -171,10 +171,10 @@ interface QmdError {
   detail: string;
 }
 
-function searchQMD(query: string): { names: string[]; error?: QmdError } {
+function searchQMD(collectionName: string, query: string): { names: string[]; error?: QmdError } {
   const result = spawnSync(
     "qmd",
-    ["query", COLLECTION_NAME, query, "-n", String(config.maxResults), "--format", "json"],
+    ["query", collectionName, query, "-n", String(config.maxResults), "--format", "json"],
     {
       encoding: "utf-8",
       timeout: config.qmdTimeoutMs,
@@ -260,7 +260,7 @@ function getCachedOrSearch(query: string): { names: string[]; error?: QmdError }
     return { names: searchCache.rankedNames };
   }
 
-  const result = searchQMD(query);
+  const result = searchQMD("pi-smart-skills", query);
   if (result.names.length > 0) {
     searchCache = {
       rankedNames: result.names,
