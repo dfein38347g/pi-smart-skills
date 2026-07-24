@@ -243,6 +243,18 @@ interface SkillCollection {
 
 let activeCollections: SkillCollection[] = [];
 
+function collectionNameForDir(dirPath: string, source: "global" | "project"): string {
+  if (source === "global") return "pi-smart-skills-global";
+  const sanitized = dirPath.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").slice(0, 60);
+  return `pi-smart-skills-proj-${sanitized}`;
+}
+
+function expandTilde(p: string): string {
+  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  if (p === "~") return os.homedir();
+  return p;
+}
+
 function getCachedOrSearch(query: string): { names: string[]; error?: QmdError } {
   if (searchCache && Date.now() - searchCache.timestamp < config.cacheTtlMs) {
     return { names: searchCache.rankedNames };
