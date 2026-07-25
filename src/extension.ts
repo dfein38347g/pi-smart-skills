@@ -119,6 +119,99 @@ function collectionNameForDir(dirPath: string): string {
 }
 
 /* ------------------------------------------------------------------ */
+/* NPM / Git package skill directory discovery                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Discover skill directories from installed pi packages.
+ *
+ * Scans agentDir/npm/node_modules for any subdirectory named
+ * "skills" that contains SKILL.md files, and also checks git-installed
+ * packages under agentDir/git/.
+ */
+function discoverPackageSkillDirs(agentDir: string): string[] {
+  const dirs = new Set<string>();
+
+  // Scan npm/node_modules/**/skills/
+  const npmModulesDir = path.join(agentDir, "npm", "node_modules");
+  try {
+    if (fs.existsSync(npmModulesDir)) {
+      scanForSkillsDirs(npmModulesDir, dirs);
+    }
+  } catch {
+    // node_modules doesn't exist or isn't readable
+  }
+
+  // Scan git packages
+  const gitDir = path.join(agentDir, "git");
+  try {
+    if (fs.existsSync(gitDir)) {
+      scanForSkillsDirs(gitDir, dirs);
+    }
+  } catch {
+    // git dir doesn't exist
+  }
+
+  return [...dirs];
+}
+
+/**
+ * Recursively scan a directory tree for any subdirectory named "skills"
+ * that contains at least one SKILL.md with valid frontmatter (name + description).
+ * Stops descending into node_modules/ within packages to avoid double-scanning.
+ * Skips paths under /configs/ — those are config templates, not real skills.
+ */
+function scanForSkillsDirs(root: string, dirs: Set<string>, depth = 0) {
+  if (depth > 5) return; // safety limit
+  try {
+    const entries = fs.readdirSync(root, { withFileTypes: true });
+    for (const entry of entries) {
+      // Skip node_modules inside packages (already scanned at top level)
+      if (entry.name === "node_modules" && depth > 0) continue;
+      // Skip hidden directories (pi's convention)
+      if (entry.name.startsWith(".")) continue;
+      if (!entry.isDirectory()) continue;
+
+      const fullPath = path.join(root, entry.name);
+      if (entry.name === "skills") {
+        // Skip config template skills (e.g., context-mode/configs/antigravity-cli/skills/)
+        const parentName = path.basename(path.dirname(fullPath));
+        const grandparentName = path.basename(path.dirname(path.dirname(fullPath)));
+        if (grandparentName === "configs") continue;
+
+        // Check if it contains at least one subdirectory with a valid SKILL.md
+        try {
+          const subEntries = fs.readdirSync(fullPath);
+          const hasValidSkill = subEntries.some((f) => {
+            const subPath = path.join(fullPath, f);
+            try {
+              if (!fs.statSync(subPath).isDirectory()) return false;
+              const skillMd = path.join(subPath, "SKILL.md");
+              if (!fs.existsSync(skillMd)) return false;
+              // Validate frontmatter has both name and description
+              const content = fs.readFileSync(skillMd, "utf-8");
+              const skill = parseSkillFile(content, skillMd);
+              return skill !== null;
+            } catch {
+              return false;
+            }
+          });
+          if (hasValidSkill) {
+            dirs.add(fs.realpathSync(fullPath));
+          }
+        } catch {
+          continue;
+        }
+      } else {
+        scanForSkillsDirs(fullPath, dirs, depth + 1);
+      }
+    }
+  } catch {
+    // Permission denied or not a directory — skip
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* QMD helpers                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -653,6 +746,7 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     const qmdOk = qmdAvailable();
     const cwd = ctx.cwd ?? process.cwd();
+    const agentDir = expandTilde("~/.pi/agent");
 
     if (!qmdOk) {
       ctx.ui?.notify("[pi-smart-skills] QMD binary not found — will inject all skills", "warning");
@@ -660,28 +754,46 @@ export default function (pi: ExtensionAPI) {
 
     const collections: SkillCollection[] = [];
     const collectionCache = new Map<string, string>();
+    const seenPaths = new Set<string>();
 
     if (qmdOk) {
-      for (const dir of config.skillDirectories) {
-        const resolved = expandTilde(dir, cwd);
-        if (!fs.existsSync(resolved)) continue;
+      // Build combined directory list: config dirs + discovered npm/git package skill dirs
+      const allDirs = [
+        ...config.skillDirectories.map((d) => expandTilde(d, cwd)),
+        ...discoverPackageSkillDirs(agentDir),
+      ];
+
+      for (const dir of allDirs) {
+        if (!fs.existsSync(dir)) continue;
+
+        // Deduplicate by resolved realpath — npm skill dirs might overlap with ~/.pi/agent/skills
+        let realPath: string;
+        try {
+          realPath = fs.realpathSync(dir);
+        } catch {
+          continue;
+        }
+        if (seenPaths.has(realPath)) continue;
+        seenPaths.add(realPath);
 
         let name: string;
         try {
-          name = collectionNameForDir(resolved);
+          name = collectionNameForDir(dir);
         } catch {
           continue;
         }
 
-        const res = ensureCollectionForDir(name, resolved, config, collectionCache);
+        const res = ensureCollectionForDir(name, dir, config, collectionCache);
         if (res.ok) {
-          collections.push({ name, dirPath: resolved });
+          collections.push({ name, dirPath: realPath });
         }
       }
 
       if (collections.length > 0) {
+        const npmCount = seenPaths.size - config.skillDirectories.length;
+        const suffix = npmCount > 0 ? ` (+${npmCount} from packages)` : "";
         ctx.ui?.notify(
-          `[pi-smart-skills] Indexed ${collections.length} skill collection(s): ${collections.map((c) => c.name).join(", ")}`,
+          `[pi-smart-skills] Indexed ${collections.length} skill collection(s)${suffix}: ${collections.map((c) => c.name).join(", ")}`,
           "info",
         );
       }

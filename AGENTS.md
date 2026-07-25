@@ -6,11 +6,12 @@ Pi extension that dynamically filters the `<available_skills>` block in the syst
 
 Single-file extension: `src/extension.ts` → re-exported by `index.ts`.
 
-**Two skill sources:**
+**Three skill sources:**
 - **Project skills** (`<cwd>/.pi/skills/*/SKILL.md`) — always injected in full, bypass QMD entirely
 - **Global skills** (`~/.pi/agent/skills/` by default) — filtered by QMD semantic relevance to user prompt
+- **Package skills** — auto-discovered at `session_start` by recursively scanning `~/.pi/agent/npm/node_modules/` and `~/.pi/agent/git/` for `skills/` directories containing valid `SKILL.md` files (must have YAML frontmatter with both `name` and `description`). Config templates under `configs/` are skipped. Deduplicated against `skillDirectories` by resolved realpath.
 
-**Flow:** `session_start` → load config, check QMD, ensure collections exist → `before_agent_start` → discover project skills, query QMD, rewrite `<available_skills>` block → `session_shutdown` → cleanup state.
+**Flow:** `session_start` → load config, check QMD, scan for package skill dirs, ensure collections exist → `before_agent_start` → discover project skills, query QMD, rewrite `<available_skills>` block → `session_shutdown` → cleanup state.
 
 **Session state** is keyed by `ctx.sessionManager.getSessionId()` — NOT by `ctx` object identity (pi creates a new context per event).
 
@@ -41,7 +42,7 @@ Config file: `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT_DIR/pi-sma
 }
 ```
 
-All fields optional — defaults are sensible. Config is merged over `DEFAULT_CONFIG` via spread.
+All fields optional — defaults are sensible. Config is merged over `DEFAULT_CONFIG` via spread. Package skill directories are discovered automatically and merged with `skillDirectories`.
 
 ## QMD Management
 
@@ -59,3 +60,4 @@ The extension creates/updates QMD collections at `session_start` but does **not*
 - YAML frontmatter parser handles single-line values and block scalars (`|`/`>`) but not nested YAML
 - Project skills are deduplicated against global skills by name (project-local wins)
 - `index.ts` has a `.ts` extension import — TS error is expected and harmless
+- `parseSkillFile` is defined after `scanForSkillsDirs` in the source — works at runtime because it's a `function` declaration (hoisted), but moving it around will break nothing

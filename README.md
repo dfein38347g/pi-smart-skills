@@ -6,21 +6,28 @@
 
 When you have many skills installed, injecting all of them into every session wastes tokens and slows inference. This extension filters global skills by semantic relevance to your prompt, while always including project-local skills.
 
-**Two skill sources:**
+**Three skill sources:**
 
 | Source | Location | Behavior |
 |--------|----------|----------|
 | **Project skills** | `<cwd>/.pi/skills/*/SKILL.md` | Always included (name + description), bypass QMD entirely |
 | **Global skills** | Configurable directories (default `~/.pi/agent/skills/`) | Filtered by QMD semantic relevance to user prompt |
+| **Package skills** | Auto-discovered from installed pi packages (`npm:`, `git:`) | Filtered by QMD — discovered at session start from `settings.json` |
 
 Project skills are deduplicated against global skills by name — if a skill exists in both locations, the project-local version wins.
+
+**Package skill discovery:** At session start, the extension recursively scans `~/.pi/agent/npm/node_modules/` and `~/.pi/agent/git/` for any `skills/` directory containing valid `SKILL.md` files. Each `SKILL.md` is validated — it must have YAML frontmatter with both `name` and `description` fields. Config template skills under `configs/` are skipped. Discovered directories are deduplicated against `skillDirectories` by resolved path and indexed into QMD collections automatically. No manual configuration needed.
 
 ## How it works
 
 ```
 session_start
   ├── Load config, check QMD availability
-  └── Ensure QMD collections exist for configured skill directories
+  ├── Scan node_modules/ and git/ for skills/ directories
+  │   ├── Validate SKILL.md frontmatter (name + description required)
+  │   ├── Skip config templates under configs/
+  │   └── Deduplicate against skillDirectories by resolved path
+  └── Ensure QMD collections exist for all skill directories
 
 before_agent_start
   ├── Discover project skills from <cwd>/.pi/skills/
@@ -91,9 +98,9 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
 | `promptCharLimit` | `4000` | Maximum user prompt length (chars) before filtering is skipped entirely |
 | `stabilityWindow` | `5` | Number of top-ranked skills compared across turns for the stability cache |
 | `qmdTimeoutMs` | `5000` | Timeout (ms) for QMD CLI subprocess calls |
-| `skillDirectories` | `[~/.pi/agent/skills]` | Directories containing global skill definitions |
+| `skillDirectories` | `[~/.pi/agent/skills]` | Directories containing global skill definitions — merged with auto-discovered package dirs |
 
-All fields are optional — config is merged over defaults via spread.
+All fields are optional — config is merged over defaults via spread. Package skill directories are discovered automatically and merged with `skillDirectories` — duplicates are deduplicated by resolved path.
 
 ## Skill file format
 
