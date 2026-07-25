@@ -308,16 +308,8 @@ function ensureCollectionForDir(
       if (collName === name) {
         const existingPath = fs.realpathSync(rawPath);
         if (existingPath === resolvedDir) {
-          // Collection exists with correct name and path — just update it
-          const updateResult = spawnSync("qmd", ["update", name], {
-            encoding: "utf-8",
-            timeout: config.qmdTimeoutMs * 2,
-          });
-          if (updateResult.error || updateResult.status !== 0) {
-            const stderr = updateResult.stderr?.trim() ?? "";
-            console.warn(`[pi-smart-skills] Failed to update collection "${name}": ${stderr}`);
-            return { ok: false, stderr };
-          }
+          // Collection exists with correct name and path — skip update here
+          // (avoids SQLite lock contention from multiple pi instances)
           return { ok: true };
         } else {
           // Same name, different path — remove stale and re-add below
@@ -410,14 +402,12 @@ function searchQMD(
   config: ExtensionConfig,
 ): { names: string[]; error?: QmdError } {
   log("debug", `searchQMD: collection=${collectionName}, query="${query}", maxResults=${config.maxResults}, timeout=${config.qmdTimeoutMs}ms`);
-  const lockFile = path.join(os.tmpdir(), "pi-smart-skills-qmd.lock");
-  const qmdArgs = ["query", collectionName, query, "-n", String(config.maxResults), "--format", "json"];
   const result = spawnSync(
-    "flock",
-    ["-w", String(Math.floor(config.qmdTimeoutMs / 1000) + 5), lockFile, "qmd", ...qmdArgs],
+    "qmd",
+    ["query", collectionName, query, "-n", String(config.maxResults), "--format", "json"],
     {
       encoding: "utf-8",
-      timeout: config.qmdTimeoutMs + 10_000, // extra headroom for lock wait
+      timeout: config.qmdTimeoutMs,
     },
   );
 
