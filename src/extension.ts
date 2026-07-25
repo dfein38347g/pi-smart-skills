@@ -375,9 +375,9 @@ async function searchSkills(
 
   const opts = {
     collections: collectionNames,
-    limit: Math.max(config.maxResults * 10, 100),
+    limit: config.maxResults * 20,
     skipRerank: false,
-    candidateLimit: 200,
+    candidateLimit: 500,
   };
 
   const extractSkills = (results: any[]): string[] => {
@@ -395,25 +395,6 @@ async function searchSkills(
     return names;
   };
 
-  const filesystemFallback = (existing: Set<string>): string[] => {
-    const extra: string[] = [];
-    for (const col of collections) {
-      try {
-        const entries = fs.readdirSync(col.dirPath, { withFileTypes: true });
-        for (const entry of entries) {
-          if (!entry.isDirectory()) continue;
-          if (existing.has(entry.name)) continue;
-          const skillMd = path.join(col.dirPath, entry.name, "SKILL.md");
-          if (fs.existsSync(skillMd)) {
-            existing.add(entry.name);
-            extra.push(entry.name);
-          }
-        }
-      } catch { /* unreadable dir */ }
-    }
-    return extra;
-  };
-
   try {
     const results = await _qmdSearch(_qmdStore, [
       { type: "lex", query },
@@ -421,17 +402,6 @@ async function searchSkills(
     ], opts);
     const names = extractSkills(results);
     log("debug", `searchSkills: ${results.length} results, ${names.length} skill names from search`);
-
-    if (names.length < config.maxResults) {
-      const nameSet = new Set(names);
-      const extra = filesystemFallback(nameSet);
-      const needed = config.maxResults - names.length;
-      names.push(...extra.slice(0, needed));
-      if (extra.length > 0) {
-        log("debug", `searchSkills: padded with ${Math.min(extra.length, needed)} filesystem skills`);
-      }
-    }
-
     return { names: names.slice(0, config.maxResults) };
   } catch (err: any) {
     if (err.message?.includes("fetch") || err.message?.includes("connect") || err.message?.includes("ECONNREFUSED")) {
