@@ -44,11 +44,18 @@ session_shutdown
 
 ## Installation
 
-Install as a pi package:
+Install directly from GitHub:
 
 ```bash
-# From a local clone or published registry
-pi install pi-smart-skills
+pi install github:dfein38347g/pi-smart-skills
+```
+
+Or clone and install locally:
+
+```bash
+git clone https://github.com/dfein38347g/pi-smart-skills.git
+cd pi-smart-skills
+pi install .
 ```
 
 The extension is declared via the `"pi"` field in `package.json` and loaded automatically by pi's jiti loader — no build step required.
@@ -81,7 +88,7 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
 | Field | Default | Description |
 |-------|---------|-------------|
 | `maxResults` | `10` | Maximum skills returned by QMD per query |
-| `promptCharLimit` | `4000` | Character limit for injected skill content in the `<available_skills>` block |
+| `promptCharLimit` | `4000` | Maximum user prompt length (chars) before filtering is skipped entirely |
 | `stabilityWindow` | `5` | Number of top-ranked skills compared across turns for the stability cache |
 | `qmdTimeoutMs` | `5000` | Timeout (ms) for QMD CLI subprocess calls |
 | `skillDirectories` | `[~/.pi/agent/skills]` | Directories containing global skill definitions |
