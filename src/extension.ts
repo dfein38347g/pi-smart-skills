@@ -6,13 +6,43 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 /* ------------------------------------------------------------------ */
+/* Logging                                                             */
+/* ------------------------------------------------------------------ */
+
+type LogLevel = "debug" | "info" | "warn" | "error";
+
+const LOG_LEVELS: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+const LOG_FILE = path.join(AGENT_DIR, "pi-smart-skills.log");
+
+let _logLevel: LogLevel = "warn";
+let _notifyFn: ((msg: string, level: "info" | "warning" | "error") => void) | null = null;
+
+function setLogLevel(level: string): void {
+  if (level in LOG_LEVELS) _logLevel = level as LogLevel;
+}
+
+function setNotify(fn: (msg: string, level: "info" | "warning" | "error") => void): void {
+  _notifyFn = fn;
+}
+
+function log(level: LogLevel, msg: string): void {
+  const ts = new Date().toISOString();
+  const prefix = level.toUpperCase().padEnd(5);
+  const line = `[${ts}] ${prefix} ${msg}`;
+  try { fs.appendFileSync(LOG_FILE, line + "\n"); } catch { /* ignore */ }
+  if (LOG_LEVELS[level] >= LOG_LEVELS[_logLevel] && _notifyFn) {
+    const piLevel = level === "error" ? "error" : level === "warn" ? "warning" : "info";
+    _notifyFn(`[pi-smart-skills] ${msg}`, piLevel);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Configuration                                                      */
 /* ------------------------------------------------------------------ */
 
-const CONFIG_PATH = path.join(
-  process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent"),
-  "pi-smart-skills.json"
-);
+const CONFIG_PATH = path.join(AGENT_DIR, "pi-smart-skills.json");
 
 interface ExtensionConfig {
   maxResults: number;
@@ -20,6 +50,7 @@ interface ExtensionConfig {
   stabilityWindow: number;
   qmdTimeoutMs: number;
   skillDirectories: string[];
+  logLevel: string;
 }
 
 const DEFAULT_CONFIG: ExtensionConfig = {
@@ -28,6 +59,7 @@ const DEFAULT_CONFIG: ExtensionConfig = {
   stabilityWindow: 5,
   qmdTimeoutMs: 5_000,
   skillDirectories: [path.join(os.homedir(), ".pi", "agent", "skills")],
+  logLevel: "warn",
 };
 
 function loadConfig(): ExtensionConfig {
@@ -38,7 +70,7 @@ function loadConfig(): ExtensionConfig {
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
     return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
   } catch (err) {
-    console.warn(`[pi-smart-skills] Failed to load config (${CONFIG_PATH}): ${err} — using defaults`);
+    log("warn", `Failed to load config (${CONFIG_PATH}): ${err} — using defaults`);
     return DEFAULT_CONFIG;
   }
 }
@@ -377,6 +409,7 @@ function searchQMD(
   query: string,
   config: ExtensionConfig,
 ): { names: string[]; error?: QmdError } {
+  log("debug", `searchQMD: collection=${collectionName}, query="${query}", maxResults=${config.maxResults}, timeout=${config.qmdTimeoutMs}ms`);
   const result = spawnSync(
     "qmd",
     ["query", collectionName, query, "-n", String(config.maxResults), "--format", "json"],
@@ -387,13 +420,16 @@ function searchQMD(
   );
 
   if (result.error) {
+    log("error", `searchQMD: spawn error: ${result.error.message}`);
     return { names: [], error: { kind: "spawn", detail: result.error.message } };
   }
   if (result.signal === "SIGTERM") {
+    log("warn", `searchQMD: timed out after ${config.qmdTimeoutMs}ms`);
     return { names: [], error: { kind: "timeout", detail: `qmd query timed out after ${config.qmdTimeoutMs}ms` } };
   }
   if (result.status !== 0) {
     const stderr = result.stderr?.trim() ?? "";
+    log("error", `searchQMD: exit ${result.status}: ${stderr}`);
     return { names: [], error: { kind: "exit", detail: `exit ${result.status}${stderr ? ": " + stderr : ""}` } };
   }
 
@@ -401,12 +437,16 @@ function searchQMD(
   try {
     parsed = JSON.parse(result.stdout);
   } catch (e) {
+    log("error", `searchQMD: JSON parse error: ${String(e)}, stdout starts: ${result.stdout?.substring(0, 200)}`);
     return { names: [], error: { kind: "parse", detail: String(e) } };
   }
 
   if (!Array.isArray(parsed)) {
+    log("error", `searchQMD: unexpected response format`);
     return { names: [], error: { kind: "parse", detail: "unexpected response format" } };
   }
+
+  log("debug", `searchQMD: got ${parsed.length} results from QMD`);
 
   const seen = new Set<string>();
   const names: string[] = [];
@@ -424,6 +464,7 @@ function searchQMD(
     if (names.length >= config.maxResults) break;
   }
 
+  log("debug", `searchQMD: returning ${names.length} skill names: [${names.join(", ")}]`);
   return { names };
 }
 
@@ -538,7 +579,9 @@ function searchAllCollections(
   query: string,
   config: ExtensionConfig,
 ): { names: string[]; error?: QmdError } {
+  log("debug", `searchAllCollections: ${collections.length} collections, query="${query}"`);
   if (collections.length === 0) {
+    log("warn", "searchAllCollections: no active collections");
     return { names: [], error: { kind: "empty", detail: "no active collections" } };
   }
 
@@ -549,9 +592,11 @@ function searchAllCollections(
     try {
       const result = searchQMD(coll.name, query, config);
       if (result.error) {
+        log("debug", `searchAllCollections: collection ${coll.name} failed: ${result.error.detail}`);
         if (!firstError) firstError = result.error;
         continue;
       }
+      log("debug", `searchAllCollections: collection ${coll.name} returned ${result.names.length} names`);
 
       for (let i = 0; i < result.names.length; i++) {
         const name = result.names[i];
@@ -560,13 +605,17 @@ function searchAllCollections(
           nameRank.set(name, i);
         }
       }
-    } catch {
+    } catch (err) {
+      log("error", `searchAllCollections: unexpected error in collection ${coll.name}: ${err}`);
       if (!firstError) firstError = { kind: "spawn", detail: "unexpected error during search" };
     }
   }
 
   const ranked = [...nameRank.entries()].sort((a, b) => a[1] - b[1]);
-  return { names: ranked.map(([name]) => name), error: firstError };
+  const finalNames = ranked.map(([name]) => name);
+  log("debug", `searchAllCollections: final ${finalNames.length} ranked names: [${finalNames.join(", ")}]`);
+  if (firstError) log("debug", `searchAllCollections: first error was: ${firstError.detail}`);
+  return { names: finalNames, error: firstError };
 }
 
 /* ------------------------------------------------------------------ */
@@ -639,15 +688,18 @@ function rewriteSkillsBlock(
   notify: NotifyFn,
 ): { newPrompt: string } | null {
   const blockMatch = systemPrompt.match(/<available_skills>[\s\S]*?<\/available_skills>/);
-  if (!blockMatch) return null;
+  if (!blockMatch) { log("debug","rewriteSkillsBlock: no <available_skills> block found"); return null; }
 
   const fullBlock = blockMatch[0];
   const allGlobalSkills = parseSkillEntries(fullBlock);
+  log("debug",`rewriteSkillsBlock: found ${allGlobalSkills.length} global skills`);
 
   // Discover project skills from filesystem
   const projectSkills = discoverProjectSkills(state.cwd, notify);
+  log("debug",`rewriteSkillsBlock: found ${projectSkills.length} project skills`);
 
   if (userPrompt.length > state.config.promptCharLimit) {
+    log("debug",`rewriteSkillsBlock: prompt too long ${userPrompt.length} > ${state.config.promptCharLimit}`);
     notify(
       `[pi-smart-skills] Prompt too long (${userPrompt.length} chars) — injecting all skills`,
       "info",
@@ -660,6 +712,7 @@ function rewriteSkillsBlock(
   try {
     result = searchAllCollections(state.activeCollections, userPrompt, state.config);
   } catch (err) {
+    log("error", `rewriteSkillsBlock: QMD search threw: ${err}`);
     notify(
       `[pi-smart-skills] QMD search error: ${err} — injecting all skills`,
       "warning",
@@ -668,6 +721,7 @@ function rewriteSkillsBlock(
   }
 
   if (result.error) {
+    log("warn", `rewriteSkillsBlock: QMD error ${result.error.kind}: ${result.error.detail}`);
     notify(
       `[pi-smart-skills] QMD ${result.error.kind}: ${result.error.detail} — injecting all skills`,
       "warning",
@@ -676,6 +730,7 @@ function rewriteSkillsBlock(
   }
 
   const rankedNames = result.names;
+  log("debug", `rewriteSkillsBlock: rankedNames=${rankedNames.length}: [${rankedNames.join(", ")}]`);
   if (rankedNames.length === 0) {
     notify(
       `[pi-smart-skills] QMD returned no results — injecting all skills`,
@@ -687,12 +742,15 @@ function rewriteSkillsBlock(
   // Filter global skills by ranked names
   const nameSet = new Set(rankedNames);
   const filteredGlobal = allGlobalSkills.filter((s) => nameSet.has(s.name));
+  log("debug", `rewriteSkillsBlock: ${filteredGlobal.length} global skills matched ranked names`);
 
   // Combine: project skills first, then filtered global skills (dedup by name)
   const projectNames = new Set(projectSkills.map((s) => s.name));
   const combinedSkills = [...projectSkills, ...filteredGlobal.filter((s) => !projectNames.has(s.name))];
+  log("debug", `rewriteSkillsBlock: ${combinedSkills.length} combined skills (project=${projectSkills.length}, filtered=${filteredGlobal.length})`);
 
   if (combinedSkills.length === 0 && allGlobalSkills.length > 0) {
+    log("warn", `rewriteSkillsBlock: no ranked skills matched, falling back to all ${allGlobalSkills.length} skills`);
     notify(
       `[pi-smart-skills] No ranked skills matched — injecting all ${allGlobalSkills.length} skills`,
       "warning",
@@ -729,6 +787,7 @@ function rewriteSkillsBlock(
 
   const totalInjected = combinedSkills.length;
   const totalAvailable = projectSkills.length + allGlobalSkills.length;
+  log("info", `rewriteSkillsBlock: injecting ${totalInjected}/${totalAvailable} skills`);
   notify(
     `[pi-smart-skills] Injected ${totalInjected}/${totalAvailable} skills (${projectSkills.length} project, top-${state.config.stabilityWindow}: ${[...newTopNSet].join(", ")})`,
     "info",
@@ -742,13 +801,19 @@ function rewriteSkillsBlock(
 /* ------------------------------------------------------------------ */
 
 export default function (pi: ExtensionAPI) {
+  log("debug", "=== EXTENSION FACTORY LOADED ===");
   pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
     const config = loadConfig();
-    const qmdOk = qmdAvailable();
+    setLogLevel(config.logLevel);
+    setNotify((msg, level) => ctx.ui?.notify(msg, level));
+    log("info", `session_start fired, sessionId=${sessionId}, logLevel=${config.logLevel}`);
     const cwd = ctx.cwd ?? process.cwd();
+    const qmdOk = qmdAvailable();
     const agentDir = expandTilde("~/.pi/agent");
 
     if (!qmdOk) {
+      log("warn", "QMD binary not found — will inject all skills");
       ctx.ui?.notify("[pi-smart-skills] QMD binary not found — will inject all skills", "warning");
     }
 
@@ -762,6 +827,7 @@ export default function (pi: ExtensionAPI) {
         ...config.skillDirectories.map((d) => expandTilde(d, cwd)),
         ...discoverPackageSkillDirs(agentDir),
       ];
+      log("debug", `session_start: scanning ${allDirs.length} directories for QMD collections`);
 
       for (const dir of allDirs) {
         if (!fs.existsSync(dir)) continue;
@@ -789,6 +855,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      log("info", `session_start: ${collections.length} QMD collections ready: [${collections.map((c) => c.name).join(", ")}]`);
       if (collections.length > 0) {
         const npmCount = seenPaths.size - config.skillDirectories.length;
         const suffix = npmCount > 0 ? ` (+${npmCount} from packages)` : "";
@@ -799,7 +866,6 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const sessionId = ctx.sessionManager.getSessionId();
     sessionMap.set(sessionId, {
       activeCollections: collections,
       searchCache: null,
@@ -817,12 +883,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
     const sp = event.systemPrompt;
-    if (!sp || typeof sp !== "string") return undefined;
+    if (!sp || typeof sp !== "string") { log("debug","before_agent_start: no systemPrompt"); return undefined; }
 
     pruneSessions();
-    const state = sessionMap.get(ctx.sessionManager.getSessionId());
-    if (!state) return undefined;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const state = sessionMap.get(sessionId);
+    if (!state) { log("debug",`before_agent_start: no session state for ${sessionId}`); return undefined; }
     state.lastAccessMs = Date.now();
+    log("debug",`before_agent_start: state found, collections=${state.activeCollections.length}, qmdOk=${state.qmdOk}`);
 
     const notify: NotifyFn = (msg, level) => {
       ctx.ui?.notify(msg, level);
@@ -830,11 +898,16 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const userPrompt = event.prompt ?? "";
+      log("debug",`before_agent_start: userPrompt length=${userPrompt.length}, limit=${state.config.promptCharLimit}`);
       const result = rewriteSkillsBlock(sp, userPrompt, state, notify);
       if (result && result.newPrompt !== sp) {
+        log("debug","before_agent_start: systemPrompt rewritten successfully");
         return { systemPrompt: result.newPrompt };
+      } else {
+        log("debug","before_agent_start: rewriteSkillsBlock returned null or unchanged prompt");
       }
     } catch (err) {
+      log("debug",`before_agent_start: ERROR ${err}`);
       notify(`[pi-smart-skills] Error: ${err}`, "error");
       return { systemPrompt: sp };
     }
