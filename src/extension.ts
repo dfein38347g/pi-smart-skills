@@ -57,7 +57,7 @@ const DEFAULT_CONFIG: ExtensionConfig = {
   maxResults: 10,
   promptCharLimit: 4000,
   stabilityWindow: 5,
-  qmdTimeoutMs: 5_000,
+  qmdTimeoutMs: 20_000,
   skillDirectories: [path.join(os.homedir(), ".pi", "agent", "skills")],
   logLevel: "warn",
 };
@@ -412,7 +412,7 @@ function searchQMD(
   log("debug", `searchQMD: collection=${collectionName}, query="${query}", maxResults=${config.maxResults}, timeout=${config.qmdTimeoutMs}ms`);
   const result = spawnSync(
     "qmd",
-    ["query", collectionName, query, "-n", String(config.maxResults), "--format", "json"],
+    ["query", collectionName, query, "-n", String(config.maxResults), "--no-rerank", "--format", "json"],
     {
       encoding: "utf-8",
       timeout: config.qmdTimeoutMs,
