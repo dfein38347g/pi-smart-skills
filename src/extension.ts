@@ -412,14 +412,14 @@ function searchQMD(
   const names: string[] = [];
   for (const item of parsed) {
     if (!item.file) continue;
+    // Only extract skill names from SKILL.md files — take the parent directory name
     const parts = item.file.split(path.sep);
-    for (let i = parts.length - 2; i >= 0; i--) {
-      const candidate = parts[i];
-      if (candidate && !seen.has(candidate)) {
-        seen.add(candidate);
-        names.push(candidate);
-        if (names.length >= config.maxResults) break;
-      }
+    const fileName = parts[parts.length - 1];
+    if (fileName !== "SKILL.md") continue;
+    const skillName = parts[parts.length - 2];
+    if (skillName && !seen.has(skillName)) {
+      seen.add(skillName);
+      names.push(skillName);
     }
     if (names.length >= config.maxResults) break;
   }
