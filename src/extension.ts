@@ -1,9 +1,26 @@
 import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionContext, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+/* ------------------------------------------------------------------ */
+/* QMD runtime path                                                    */
+/* ------------------------------------------------------------------ */
+
+const QMD_STORE_PATH = path.join(
+  os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "store.js"
+);
+const QMD_COLL_PATH = path.join(
+  os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "collections.js"
+);
+
+let _qmdStore: any = null;
+let _qmdSearch: any = null;
+let _removeCollection: any = null;
+let _syncConfigToDb: any = null;
+let _reindexCollection: any = null;
+let _qmdCollModule: any = null;
 
 /* ------------------------------------------------------------------ */
 /* Logging                                                             */
@@ -102,7 +119,6 @@ interface SessionState {
   qmdOk: boolean;
   cwd: string;
   lastAccessMs: number;
-  collectionCache: Map<string, string> | null;
 }
 
 const sessionMap = new Map<string, SessionState>();
@@ -247,23 +263,50 @@ function scanForSkillsDirs(root: string, dirs: Set<string>, depth = 0) {
 /* QMD helpers                                                        */
 /* ------------------------------------------------------------------ */
 
-function qmdAvailable(): boolean {
-  const result = spawnSync("qmd", ["--version"], {
-    encoding: "utf-8",
-    timeout: 3_000,
-  });
-  return !result.error && result.status === 0;
+async function initQmdStore(): Promise<boolean> {
+  try {
+    if (!_qmdStore) {
+      const qmd = await import(QMD_STORE_PATH);
+      if (!qmd.enableProductionMode) return false;
+      qmd.enableProductionMode();
+      _qmdStore = qmd.createStore();
+      _qmdSearch = qmd.structuredSearch;
+      _removeCollection = qmd.removeCollection;
+      _syncConfigToDb = qmd.syncConfigToDb;
+      _reindexCollection = qmd.reindexCollection;
+      _qmdCollModule = await import(QMD_COLL_PATH);
+      const config = _qmdCollModule.loadConfig();
+      qmd.syncConfigToDb(_qmdStore.db, config);
+      if (_qmdStore.db) {
+        const LLM_PATH = path.join(os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "llm.js");
+        const CFG_PATH = path.join(os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "configured-llm.js");
+        const { setDefaultLLM } = await import(LLM_PATH);
+        const { createConfiguredLLM } = await import(CFG_PATH);
+        setDefaultLLM(createConfiguredLLM(config?.models, {
+          embedModel: config?.models?.embed,
+          generateModel: config?.models?.generate,
+          rerankModel: config?.models?.rerank,
+        }));
+      }
+    }
+    return !!_qmdSearch;
+  } catch (e) {
+    log("debug", `initQmdStore: failed: ${e}`);
+    return false;
+  }
 }
 
-function ensureCollectionForDir(
+function qmdAvailable(): boolean {
+  return !!_qmdStore;
+}
+
+async function ensureCollectionForDir(
   name: string,
   dirPath: string,
   config: ExtensionConfig,
-  collectionCache: Map<string, string> | null,
-): { ok: boolean; stderr?: string } {
-  if (!fs.existsSync(dirPath)) {
-    return { ok: false };
-  }
+): Promise<{ ok: boolean; stderr?: string }> {
+  if (!_qmdStore || !_qmdCollModule) return { ok: false };
+  if (!fs.existsSync(dirPath)) return { ok: false };
 
   let resolvedDir: string;
   try {
@@ -272,192 +315,132 @@ function ensureCollectionForDir(
     return { ok: false };
   }
 
-  const listResult = spawnSync("qmd", ["collection", "list"], {
-    encoding: "utf-8",
-    timeout: config.qmdTimeoutMs,
-  });
+  try {
+    // Check existing collections directly from DB
+    const existing = _qmdStore.db.prepare(
+      "SELECT name, path FROM store_collections WHERE name = ?"
+    ).get(name) as { name: string; path: string } | undefined;
 
-  if (!listResult.error && listResult.status === 0) {
-    const collectionNames = parseCollectionList(listResult.stdout);
-
-    const nameToPath = new Map<string, string>();
-    for (const collName of collectionNames) {
-      if (collectionCache?.has(collName)) {
-        nameToPath.set(collName, collectionCache.get(collName)!);
-      } else {
-        const showResult = spawnSync("qmd", ["collection", "show", collName], {
-          encoding: "utf-8",
-          timeout: config.qmdTimeoutMs,
-        });
-        if (!showResult.error && showResult.status === 0) {
-          const pathMatch = showResult.stdout.match(/Path:\s+(.+)/);
-          if (pathMatch) {
-            nameToPath.set(collName, pathMatch[1].trim());
-          }
-        }
-      }
-    }
-
-    if (collectionCache) {
-      for (const [n, p] of nameToPath) {
-        collectionCache.set(n, p);
-      }
-    }
-
-    for (const [collName, rawPath] of nameToPath) {
-      if (collName === name) {
-        const existingPath = fs.realpathSync(rawPath);
-        if (existingPath === resolvedDir) {
-          // Collection exists with correct name and path — skip update here
-          // (avoids SQLite lock contention from multiple pi instances)
-          return { ok: true };
-        } else {
-          // Same name, different path — remove stale and re-add below
-          const removeResult = spawnSync("qmd", ["collection", "remove", collName], {
-            encoding: "utf-8",
-            timeout: config.qmdTimeoutMs,
-          });
-          if (removeResult.error || removeResult.status !== 0) {
-            console.warn(`[pi-smart-skills] Failed to remove stale collection "${collName}"`);
-            return { ok: false };
-          }
-          break;
-        }
-      }
+    if (existing) {
       try {
-        const existingPath = fs.realpathSync(rawPath);
-        if (existingPath === resolvedDir) {
-          const removeResult = spawnSync("qmd", ["collection", "remove", collName], {
-            encoding: "utf-8",
-            timeout: config.qmdTimeoutMs,
-          });
-          if (removeResult.error || removeResult.status !== 0) {
-            console.warn(`[pi-smart-skills] Failed to remove stale collection "${collName}"`);
-            return { ok: false };
-          }
-          break;
+        if (fs.realpathSync(existing.path) === resolvedDir) {
+          return { ok: true };
         }
       } catch {
-        // realpath failed — skip this collection
+        // path may not exist — remove stale
       }
+      // Remove stale collection
+      if (_removeCollection) _removeCollection(_qmdStore.db, name);
+      if (_qmdCollModule.removeCollection) _qmdCollModule.removeCollection(name);
     }
+
+    // Add new collection to YAML config
+    _qmdCollModule.addCollection(name, resolvedDir);
+    // Sync config to DB
+    _syncConfigToDb(_qmdStore.db, _qmdCollModule.loadConfig());
+    // Index files (async — does not block)
+    _reindexCollection(_qmdStore, name).catch((err: any) => {
+      log("debug", `reindexCollection ${name}: ${err.message}`);
+    });
+
+    return { ok: true };
+  } catch (err: any) {
+    log("warn", `ensureCollectionForDir(${name}): ${err.message}`);
+    return { ok: false, stderr: err.message };
   }
-
-  const addResult = spawnSync("qmd", ["collection", "add", resolvedDir, "--name", name], {
-    encoding: "utf-8",
-    timeout: config.qmdTimeoutMs,
-  });
-
-  if (addResult.error || addResult.status !== 0) {
-    const stderr = addResult.stderr?.trim() ?? "";
-    console.warn(`[pi-smart-skills] Failed to add collection "${name}": ${stderr}`);
-    return { ok: false, stderr };
-  }
-
-  const updateResult = spawnSync("qmd", ["update", name], {
-    encoding: "utf-8",
-    timeout: config.qmdTimeoutMs * 2,
-  });
-
-  if (updateResult.error || updateResult.status !== 0) {
-    const stderr = updateResult.stderr?.trim() ?? "";
-    console.warn(`[pi-smart-skills] Failed to update collection "${name}": ${stderr}`);
-    return { ok: false, stderr };
-  }
-
-  return { ok: true };
 }
 
 interface QmdError {
-  kind: "spawn" | "timeout" | "exit" | "parse" | "empty";
+  kind: "import" | "store" | "search" | "empty";
   detail: string;
 }
 
-function parseCollectionList(stdout: string): string[] {
-  // Try JSON format first
-  try {
-    const parsed = JSON.parse(stdout);
-    if (Array.isArray(parsed)) {
-      const names = parsed.map((item: any) => item.name ?? item.id ?? String(item)).filter(Boolean);
-      if (names.length > 0) return names;
-    }
-  } catch {
-    // Not JSON — fall through to regex
-  }
-
-  // Fallback: regex parsing
-  const matches = stdout.match(/^\s*[a-zA-Z0-9_-]+\s+\(qmd:\/\//gm) ?? [];
-  const names = matches.map((line) => line.trim().split(/\s/)[0]);
-
-  if (names.length === 0) {
-    console.warn("[pi-smart-skills] QMD collection list regex matched zero lines — output may have changed format");
-  }
-
-  return names;
-}
-
-function searchQMD(
-  collectionName: string,
+async function searchSkills(
   query: string,
   config: ExtensionConfig,
-): { names: string[]; error?: QmdError } {
-  log("debug", `searchQMD: collection=${collectionName}, query="${query}", maxResults=${config.maxResults}, timeout=${config.qmdTimeoutMs}ms`);
-  const result = spawnSync(
-    "qmd",
-    ["query", collectionName, query, "-n", String(config.maxResults), "--format", "json"],
-    {
-      encoding: "utf-8",
-      timeout: config.qmdTimeoutMs,
-    },
-  );
-
-  if (result.error) {
-    log("error", `searchQMD: spawn error: ${result.error.message}`);
-    return { names: [], error: { kind: "spawn", detail: result.error.message } };
-  }
-  if (result.signal === "SIGTERM") {
-    log("warn", `searchQMD: timed out after ${config.qmdTimeoutMs}ms`);
-    return { names: [], error: { kind: "timeout", detail: `qmd query timed out after ${config.qmdTimeoutMs}ms` } };
-  }
-  if (result.status !== 0) {
-    const stderr = result.stderr?.trim() ?? "";
-    log("error", `searchQMD: exit ${result.status}: ${stderr}`);
-    return { names: [], error: { kind: "exit", detail: `exit ${result.status}${stderr ? ": " + stderr : ""}` } };
+  collections: SkillCollection[],
+): Promise<{ names: string[]; error?: QmdError }> {
+  if (!_qmdStore || !_qmdSearch) {
+    log("error", "searchSkills: QMD not initialized");
+    return { names: [], error: { kind: "store", detail: "QMD not initialized" } };
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(result.stdout);
-  } catch (e) {
-    log("error", `searchQMD: JSON parse error: ${String(e)}, stdout starts: ${result.stdout?.substring(0, 200)}`);
-    return { names: [], error: { kind: "parse", detail: String(e) } };
+  if (collections.length === 0) {
+    log("warn", "searchSkills: no collections to search");
+    return { names: [], error: { kind: "empty", detail: "no active collections" } };
   }
 
-  if (!Array.isArray(parsed)) {
-    log("error", `searchQMD: unexpected response format`);
-    return { names: [], error: { kind: "parse", detail: "unexpected response format" } };
-  }
+  const collectionNames = collections.map((c) => c.name);
+  log("debug", `searchSkills: ${collectionNames.length} collections, query="${query}"`);
 
-  log("debug", `searchQMD: got ${parsed.length} results from QMD`);
+  const opts = {
+    collections: collectionNames,
+    limit: Math.max(config.maxResults * 10, 100),
+    skipRerank: false,
+    candidateLimit: 200,
+  };
 
-  const seen = new Set<string>();
-  const names: string[] = [];
-  for (const item of parsed) {
-    if (!item.file) continue;
-    // Only extract skill names from SKILL.md files — take the parent directory name
-    const parts = item.file.split(path.sep);
-    const fileName = parts[parts.length - 1];
-    if (fileName !== "SKILL.md") continue;
-    const skillName = parts[parts.length - 2];
-    if (skillName && !seen.has(skillName)) {
-      seen.add(skillName);
-      names.push(skillName);
+  const extractSkills = (results: any[]): string[] => {
+    const seen = new Set<string>();
+    const names: string[] = [];
+    for (const r of results) {
+      const parts = (r.file ?? r.filepath ?? "").split("/");
+      const last = parts[parts.length - 1];
+      const dirName = parts[parts.length - 2];
+      if (last === "SKILL.md" && dirName && !seen.has(dirName)) {
+        seen.add(dirName);
+        names.push(dirName);
+      }
     }
-    if (names.length >= config.maxResults) break;
-  }
+    return names;
+  };
 
-  log("debug", `searchQMD: returning ${names.length} skill names: [${names.join(", ")}]`);
-  return { names };
+  const filesystemFallback = (existing: Set<string>): string[] => {
+    const extra: string[] = [];
+    for (const col of collections) {
+      try {
+        const entries = fs.readdirSync(col.dirPath, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          if (existing.has(entry.name)) continue;
+          const skillMd = path.join(col.dirPath, entry.name, "SKILL.md");
+          if (fs.existsSync(skillMd)) {
+            existing.add(entry.name);
+            extra.push(entry.name);
+          }
+        }
+      } catch { /* unreadable dir */ }
+    }
+    return extra;
+  };
+
+  try {
+    const results = await _qmdSearch(_qmdStore, [
+      { type: "lex", query },
+      { type: "vec", query },
+    ], opts);
+    const names = extractSkills(results);
+    log("debug", `searchSkills: ${results.length} results, ${names.length} skill names from search`);
+
+    if (names.length < config.maxResults) {
+      const nameSet = new Set(names);
+      const extra = filesystemFallback(nameSet);
+      const needed = config.maxResults - names.length;
+      names.push(...extra.slice(0, needed));
+      if (extra.length > 0) {
+        log("debug", `searchSkills: padded with ${Math.min(extra.length, needed)} filesystem skills`);
+      }
+    }
+
+    return { names: names.slice(0, config.maxResults) };
+  } catch (err: any) {
+    if (err.message?.includes("fetch") || err.message?.includes("connect") || err.message?.includes("ECONNREFUSED")) {
+      log("warn", `searchSkills: embedding service unavailable (${err.message}) — bypassing filter, injecting all skills`);
+      return { names: [], error: { kind: "search", detail: "embedding service unavailable" } };
+    }
+    log("error", `searchSkills: ${err.message}`);
+    return { names: [], error: { kind: "search", detail: err.message } };
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -563,54 +546,6 @@ function parseSkillFile(content: string, filePath: string): DiscoveredSkill | nu
 }
 
 /* ------------------------------------------------------------------ */
-/* Search across collections                                          */
-/* ------------------------------------------------------------------ */
-
-function searchAllCollections(
-  collections: SkillCollection[],
-  query: string,
-  config: ExtensionConfig,
-): { names: string[]; error?: QmdError } {
-  log("debug", `searchAllCollections: ${collections.length} collections, query="${query}"`);
-  if (collections.length === 0) {
-    log("warn", "searchAllCollections: no active collections");
-    return { names: [], error: { kind: "empty", detail: "no active collections" } };
-  }
-
-  const nameRank = new Map<string, number>();
-  let firstError: QmdError | undefined;
-
-  for (const coll of collections) {
-    try {
-      const result = searchQMD(coll.name, query, config);
-      if (result.error) {
-        log("debug", `searchAllCollections: collection ${coll.name} failed: ${result.error.detail}`);
-        if (!firstError) firstError = result.error;
-        continue;
-      }
-      log("debug", `searchAllCollections: collection ${coll.name} returned ${result.names.length} names`);
-
-      for (let i = 0; i < result.names.length; i++) {
-        const name = result.names[i];
-        const current = nameRank.get(name);
-        if (current === undefined || i < current) {
-          nameRank.set(name, i);
-        }
-      }
-    } catch (err) {
-      log("error", `searchAllCollections: unexpected error in collection ${coll.name}: ${err}`);
-      if (!firstError) firstError = { kind: "spawn", detail: "unexpected error during search" };
-    }
-  }
-
-  const ranked = [...nameRank.entries()].sort((a, b) => a[1] - b[1]);
-  const finalNames = ranked.map(([name]) => name);
-  log("debug", `searchAllCollections: final ${finalNames.length} ranked names: [${finalNames.join(", ")}]`);
-  if (firstError) log("debug", `searchAllCollections: first error was: ${firstError.detail}`);
-  return { names: finalNames, error: firstError };
-}
-
-/* ------------------------------------------------------------------ */
 /* System prompt rewriting                                            */
 /* ------------------------------------------------------------------ */
 
@@ -673,12 +608,12 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
 
 type NotifyFn = (msg: string, level: "info" | "warning" | "error") => void;
 
-function rewriteSkillsBlock(
+async function rewriteSkillsBlock(
   systemPrompt: string,
   userPrompt: string,
   state: SessionState,
   notify: NotifyFn,
-): { newPrompt: string } | null {
+): Promise<{ newPrompt: string } | null> {
   const blockMatch = systemPrompt.match(/<available_skills>[\s\S]*?<\/available_skills>/);
   if (!blockMatch) { log("debug","rewriteSkillsBlock: no <available_skills> block found"); return null; }
 
@@ -699,10 +634,14 @@ function rewriteSkillsBlock(
     return { newPrompt: systemPrompt };
   }
 
-  // Search global collections via QMD
+  // Search global collections via QMD in-process
   let result: { names: string[]; error?: QmdError };
   try {
-    result = searchAllCollections(state.activeCollections, userPrompt, state.config);
+    result = await searchSkills(
+      userPrompt,
+      state.config,
+      state.activeCollections,
+    );
   } catch (err) {
     log("error", `rewriteSkillsBlock: QMD search threw: ${err}`);
     notify(
@@ -801,16 +740,15 @@ export default function (pi: ExtensionAPI) {
     setNotify((msg, level) => ctx.ui?.notify(msg, level));
     log("info", `session_start fired, sessionId=${sessionId}, logLevel=${config.logLevel}`);
     const cwd = ctx.cwd ?? process.cwd();
-    const qmdOk = qmdAvailable();
+    const qmdOk = await initQmdStore();
     const agentDir = expandTilde("~/.pi/agent");
 
     if (!qmdOk) {
-      log("warn", "QMD binary not found — will inject all skills");
-      ctx.ui?.notify("[pi-smart-skills] QMD binary not found — will inject all skills", "warning");
+      log("warn", "QMD store not available — will inject all skills");
+      ctx.ui?.notify("[pi-smart-skills] QMD store not available — will inject all skills", "warning");
     }
 
     const collections: SkillCollection[] = [];
-    const collectionCache = new Map<string, string>();
     const seenPaths = new Set<string>();
 
     if (qmdOk) {
@@ -841,7 +779,7 @@ export default function (pi: ExtensionAPI) {
           continue;
         }
 
-        const res = ensureCollectionForDir(name, dir, config, collectionCache);
+        const res = await ensureCollectionForDir(name, dir, config);
         if (res.ok) {
           collections.push({ name, dirPath: realPath });
         }
@@ -865,7 +803,6 @@ export default function (pi: ExtensionAPI) {
       qmdOk,
       cwd,
       lastAccessMs: Date.now(),
-      collectionCache,
     });
   });
 
@@ -891,7 +828,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const userPrompt = event.prompt ?? "";
       log("debug",`before_agent_start: userPrompt length=${userPrompt.length}, limit=${state.config.promptCharLimit}`);
-      const result = rewriteSkillsBlock(sp, userPrompt, state, notify);
+      const result = await rewriteSkillsBlock(sp, userPrompt, state, notify);
       if (result && result.newPrompt !== sp) {
         log("debug","before_agent_start: systemPrompt rewritten successfully");
         return { systemPrompt: result.newPrompt };
