@@ -410,12 +410,14 @@ function searchQMD(
   config: ExtensionConfig,
 ): { names: string[]; error?: QmdError } {
   log("debug", `searchQMD: collection=${collectionName}, query="${query}", maxResults=${config.maxResults}, timeout=${config.qmdTimeoutMs}ms`);
+  const lockFile = path.join(os.tmpdir(), "pi-smart-skills-qmd.lock");
+  const qmdArgs = ["query", collectionName, query, "-n", String(config.maxResults), "--format", "json"];
   const result = spawnSync(
-    "qmd",
-    ["query", collectionName, query, "-n", String(config.maxResults), "--no-rerank", "--format", "json"],
+    "flock",
+    ["-w", String(Math.floor(config.qmdTimeoutMs / 1000) + 5), lockFile, "qmd", ...qmdArgs],
     {
       encoding: "utf-8",
-      timeout: config.qmdTimeoutMs,
+      timeout: config.qmdTimeoutMs + 10_000, // extra headroom for lock wait
     },
   );
 
