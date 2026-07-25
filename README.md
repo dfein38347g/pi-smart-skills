@@ -1,46 +1,104 @@
 # pi-smart-skills
 
-Standalone [pi](https://github.com/earendil-works/pi) extension that uses QMD hybrid search to lazily inject the most relevant skills into the system prompt.
+[pi](https://github.com/earendil-works/pi) extension that uses [QMD](https://github.com/qmd-remote/qmd) hybrid search to lazily inject the most relevant skills into the system prompt — keeping context lean while always including project-local skills.
 
-## Overview
+## What it does
 
-Instead of loading all skills into every session, `pi-smart-skills` ranks skills by relevance to the user's current prompt using QMD's hybrid search (expansion + BM25 + vector + rerank) and injects only the top matches. This reduces system prompt size, improves response quality, and speeds up inference.
+When you have many skills installed, injecting all of them into every session wastes tokens and slows inference. This extension filters global skills by semantic relevance to your prompt, while always including project-local skills.
 
-## Architecture
+**Two skill sources:**
 
-- **Single-file extension** — no build step, runs via pi's jiti loader
-- **Background cron** — re-indexes skills every 5 minutes using `qmd update`
-- **Top-3 stability check** — only rewrites the system prompt when the top-3 ranked skills change, preventing KV cache thrashing
-- **Aggressive failover** — on any error, timeout, or empty result, all skills remain in the system prompt
+| Source | Location | Behavior |
+|--------|----------|----------|
+| **Project skills** | `<cwd>/.pi/skills/*/SKILL.md` | Always included (name + description), bypass QMD entirely |
+| **Global skills** | Configurable directories (default `~/.pi/agent/skills/`) | Filtered by QMD semantic relevance to user prompt |
+
+Project skills are deduplicated against global skills by name — if a skill exists in both locations, the project-local version wins.
+
+## How it works
+
+```
+session_start
+  ├── Load config, check QMD availability
+  └── Ensure QMD collections exist for configured skill directories
+
+before_agent_start
+  ├── Discover project skills from <cwd>/.pi/skills/
+  ├── Query QMD with user prompt against global skill collections
+  ├── Combine: project skills (first) + ranked global skills
+  ├── Stability cache: skip rewrite if top-N ranked skills unchanged
+  └── Rewrite <available_skills> block in system prompt
+
+session_shutdown
+  └── Clean up per-session state
+```
+
+**Stability cache:** Compares the top-N ranked global skill names (configurable via `stabilityWindow`, default 5) across turns. If the set is unchanged, reuses the cached results to avoid rewriting the system prompt unnecessarily — preventing KV cache thrashing.
+
+**Graceful degradation:** On any QMD failure (spawn error, timeout, parse error, empty results), the extension falls back to returning the original system prompt unchanged — all skills remain available.
 
 ## Requirements
 
 - [pi](https://github.com/earendil-works/pi) coding agent installed
-- [QMD](https://github.com/qmd-remote/qmd) CLI available at `~/.local/bin/qmd`
+- [QMD](https://github.com/qmd-remote/qmd) CLI installed and available on `PATH`
 
 ## Installation
 
+Install as a pi package:
+
 ```bash
-mkdir -p ~/.pi/agent/extensions/pi-smart-skills
-# Place the extension file at:
-# ~/.pi/agent/extensions/pi-smart-skills/index.ts
+# From a local clone or published registry
+pi install pi-smart-skills
 ```
 
-pi will auto-load the extension on next start.
+The extension is declared via the `"pi"` field in `package.json` and loaded automatically by pi's jiti loader — no build step required.
+
+## QMD setup
+
+The extension creates and updates QMD collections at session start. For best performance with many skills, set up a system cron job to periodically re-index:
+
+```bash
+# Re-index every 5 minutes
+*/5 * * * * qmd update
+```
+
+Without a cron job, collections are only updated when you start a new pi session.
 
 ## Configuration
 
-Optional config at `~/.pi/agent/pi-smart-skills.json`:
+Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT_DIR/pi-smart-skills.json`):
 
 ```json
 {
   "maxResults": 10,
-  "promptCharLimit": 60000,
-  "stabilityWindow": 3,
+  "promptCharLimit": 4000,
+  "stabilityWindow": 5,
   "qmdTimeoutMs": 5000,
-  "cacheTtlMs": 60000,
-  "cronIntervalMs": 300000
+  "skillDirectories": ["~/.pi/agent/skills"]
 }
 ```
 
-See the plan in `plans/` for default values and detailed behavior.
+| Field | Default | Description |
+|-------|---------|-------------|
+| `maxResults` | `10` | Maximum skills returned by QMD per query |
+| `promptCharLimit` | `4000` | Character limit for injected skill content in the `<available_skills>` block |
+| `stabilityWindow` | `5` | Number of top-ranked skills compared across turns for the stability cache |
+| `qmdTimeoutMs` | `5000` | Timeout (ms) for QMD CLI subprocess calls |
+| `skillDirectories` | `[~/.pi/agent/skills]` | Directories containing global skill definitions |
+
+All fields are optional — config is merged over defaults via spread.
+
+## Skill file format
+
+Skills are discovered as `SKILL.md` files. Each skill directory should contain a single `SKILL.md` with YAML frontmatter:
+
+```markdown
+---
+name: my-skill
+description: What this skill does and when to use it
+---
+
+Skill instructions here...
+```
+
+The extension parses the `name` and `description` fields from the frontmatter to build the `<available_skills>` block — matching vanilla pi's format (name + description + location only).

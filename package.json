@@ -1,0 +1,30 @@
+{
+  "name": "pi-smart-skills",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Standalone pi extension that uses QMD hybrid search to lazily inject the most relevant skills into the system prompt",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "skills",
+    "qmd"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

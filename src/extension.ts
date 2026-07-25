@@ -1,4 +1,5 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionContext, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -18,7 +19,6 @@ interface ExtensionConfig {
   promptCharLimit: number;
   stabilityWindow: number;
   qmdTimeoutMs: number;
-  cronIntervalMs: number;
   skillDirectories: string[];
 }
 
@@ -27,15 +27,18 @@ const DEFAULT_CONFIG: ExtensionConfig = {
   promptCharLimit: 4000,
   stabilityWindow: 5,
   qmdTimeoutMs: 5_000,
-  cronIntervalMs: 5 * 60 * 1_000,
   skillDirectories: [path.join(os.homedir(), ".pi", "agent", "skills")],
 };
 
 function loadConfig(): ExtensionConfig {
   try {
+    if (!fs.existsSync(CONFIG_PATH)) {
+      return DEFAULT_CONFIG;
+    }
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
     return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
-  } catch {
+  } catch (err) {
+    console.warn(`[pi-smart-skills] Failed to load config (${CONFIG_PATH}): ${err} — using defaults`);
     return DEFAULT_CONFIG;
   }
 }
@@ -57,6 +60,7 @@ interface DiscoveredSkill {
 interface CacheEntry {
   rankedNames: string[];
   topNSet: Set<string>;
+  skillCount: number;
 }
 
 interface SessionState {
@@ -64,11 +68,30 @@ interface SessionState {
   searchCache: CacheEntry | null;
   config: ExtensionConfig;
   qmdOk: boolean;
-  cronTimer: ReturnType<typeof setInterval> | null;
   cwd: string;
+  lastAccessMs: number;
+  collectionCache: Map<string, string> | null;
 }
 
-const sessionMap = new Map<object, SessionState>();
+const sessionMap = new Map<string, SessionState>();
+
+const MAX_SESSIONS = 100;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1_000;
+
+function pruneSessions(): void {
+  const now = Date.now();
+  for (const [id, state] of sessionMap) {
+    if (now - state.lastAccessMs > SESSION_TTL_MS) {
+      sessionMap.delete(id);
+    }
+  }
+  if (sessionMap.size > MAX_SESSIONS) {
+    const sorted = [...sessionMap.entries()].sort((a, b) => a[1].lastAccessMs - b[1].lastAccessMs);
+    for (let i = 0; i < sessionMap.size - MAX_SESSIONS; i++) {
+      sessionMap.delete(sorted[i][0]);
+    }
+  }
+}
 
 interface SkillCollection {
   name: string;
@@ -91,7 +114,8 @@ function collectionNameForDir(dirPath: string): string {
   const sanitized = segments.map((seg) =>
     seg.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-")
   ).join("-");
-  return `pi-smart-skills-${sanitized.slice(0, 60)}`;
+  const hash = createHash("sha256").update(resolved).digest("hex").slice(0, 8);
+  return `${sanitized}-${hash}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -110,12 +134,18 @@ function ensureCollectionForDir(
   name: string,
   dirPath: string,
   config: ExtensionConfig,
+  collectionCache: Map<string, string> | null,
 ): { ok: boolean; stderr?: string } {
   if (!fs.existsSync(dirPath)) {
     return { ok: false };
   }
 
-  const resolvedDir = fs.realpathSync(dirPath);
+  let resolvedDir: string;
+  try {
+    resolvedDir = fs.realpathSync(dirPath);
+  } catch {
+    return { ok: false };
+  }
 
   const listResult = spawnSync("qmd", ["collection", "list"], {
     encoding: "utf-8",
@@ -125,34 +155,73 @@ function ensureCollectionForDir(
   if (!listResult.error && listResult.status === 0) {
     const collectionNames = parseCollectionList(listResult.stdout);
 
+    const nameToPath = new Map<string, string>();
     for (const collName of collectionNames) {
-      if (collName === name) {
-        return { ok: true };
-      }
-
-      const showResult = spawnSync("qmd", ["collection", "show", collName], {
-        encoding: "utf-8",
-        timeout: config.qmdTimeoutMs,
-      });
-
-      if (showResult.error || showResult.status !== 0) {
-        continue;
-      }
-
-      const pathMatch = showResult.stdout.match(/Path:\s+(.+)/);
-      if (pathMatch) {
-        try {
-          const existingPath = fs.realpathSync(pathMatch[1].trim());
-          if (existingPath === resolvedDir) {
-            spawnSync("qmd", ["collection", "remove", collName], {
-              encoding: "utf-8",
-              timeout: config.qmdTimeoutMs,
-            });
-            break;
+      if (collectionCache?.has(collName)) {
+        nameToPath.set(collName, collectionCache.get(collName)!);
+      } else {
+        const showResult = spawnSync("qmd", ["collection", "show", collName], {
+          encoding: "utf-8",
+          timeout: config.qmdTimeoutMs,
+        });
+        if (!showResult.error && showResult.status === 0) {
+          const pathMatch = showResult.stdout.match(/Path:\s+(.+)/);
+          if (pathMatch) {
+            nameToPath.set(collName, pathMatch[1].trim());
           }
-        } catch {
-          // realpath failed — skip this collection
         }
+      }
+    }
+
+    if (collectionCache) {
+      for (const [n, p] of nameToPath) {
+        collectionCache.set(n, p);
+      }
+    }
+
+    for (const [collName, rawPath] of nameToPath) {
+      if (collName === name) {
+        const existingPath = fs.realpathSync(rawPath);
+        if (existingPath === resolvedDir) {
+          // Collection exists with correct name and path — just update it
+          const updateResult = spawnSync("qmd", ["update", name], {
+            encoding: "utf-8",
+            timeout: config.qmdTimeoutMs * 2,
+          });
+          if (updateResult.error || updateResult.status !== 0) {
+            const stderr = updateResult.stderr?.trim() ?? "";
+            console.warn(`[pi-smart-skills] Failed to update collection "${name}": ${stderr}`);
+            return { ok: false, stderr };
+          }
+          return { ok: true };
+        } else {
+          // Same name, different path — remove stale and re-add below
+          const removeResult = spawnSync("qmd", ["collection", "remove", collName], {
+            encoding: "utf-8",
+            timeout: config.qmdTimeoutMs,
+          });
+          if (removeResult.error || removeResult.status !== 0) {
+            console.warn(`[pi-smart-skills] Failed to remove stale collection "${collName}"`);
+            return { ok: false };
+          }
+          break;
+        }
+      }
+      try {
+        const existingPath = fs.realpathSync(rawPath);
+        if (existingPath === resolvedDir) {
+          const removeResult = spawnSync("qmd", ["collection", "remove", collName], {
+            encoding: "utf-8",
+            timeout: config.qmdTimeoutMs,
+          });
+          if (removeResult.error || removeResult.status !== 0) {
+            console.warn(`[pi-smart-skills] Failed to remove stale collection "${collName}"`);
+            return { ok: false };
+          }
+          break;
+        }
+      } catch {
+        // realpath failed — skip this collection
       }
     }
   }
@@ -168,7 +237,7 @@ function ensureCollectionForDir(
     return { ok: false, stderr };
   }
 
-  const updateResult = spawnSync("qmd", ["update"], {
+  const updateResult = spawnSync("qmd", ["update", name], {
     encoding: "utf-8",
     timeout: config.qmdTimeoutMs * 2,
   });
@@ -200,7 +269,7 @@ function parseCollectionList(stdout: string): string[] {
   }
 
   // Fallback: regex parsing
-  const matches = stdout.match(/^[a-zA-Z0-9_-]+\s+\(qmd:\/\//gm) ?? [];
+  const matches = stdout.match(/^\s*[a-zA-Z0-9_-]+\s+\(qmd:\/\//gm) ?? [];
   const names = matches.map((line) => line.trim().split(/\s/)[0]);
 
   if (names.length === 0) {
@@ -227,7 +296,7 @@ function searchQMD(
   if (result.error) {
     return { names: [], error: { kind: "spawn", detail: result.error.message } };
   }
-  if (result.status === 124 || result.signal === "SIGTERM") {
+  if (result.signal === "SIGTERM") {
     return { names: [], error: { kind: "timeout", detail: `qmd query timed out after ${config.qmdTimeoutMs}ms` } };
   }
   if (result.status !== 0) {
@@ -310,31 +379,47 @@ function discoverProjectSkills(cwd: string, notify: NotifyFn): DiscoveredSkill[]
   return skills;
 }
 
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseYamlValue(block: string, key: string): string | null {
+  const safeKey = escapeRegex(key);
+
+  // Single-line value
+  const singleMatch = block.match(new RegExp(`^${safeKey}:\\s*(.+)$`, "m"));
+  if (singleMatch) {
+    let val = singleMatch[1].trim();
+    // Strip quotes
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    return val;
+  }
+
+  // Block scalar (| or >)
+  const blockMatch = block.match(new RegExp(`^${safeKey}:\\s*[|>][-+]?(\\n(( {2,}|\\t)[^\\n]*\\n?)*)`, "m"));
+  if (blockMatch) {
+    const rawLines = blockMatch[1].split("\n").filter((l: string) => l.trim());
+    if (rawLines.length === 0) return "";
+    const minIndent = Math.min(...rawLines.map((l: string) => (/^(\s*)/.exec(l)?.[1].length ?? 0)));
+    const dedented = rawLines.map((l: string) => l.slice(minIndent)).join("\n");
+    return dedented.trim();
+  }
+
+  return null;
+}
+
 function parseSkillFile(content: string, filePath: string): DiscoveredSkill | null {
   // Try YAML frontmatter first
   const yamlMatch = content.match(/^---\n([\s\S]*?)\n---/);
   if (yamlMatch) {
     const yamlBlock = yamlMatch[1];
-    const nameMatch = yamlBlock.match(/^name:\s*(.+)$/m);
-    const descMatch = yamlBlock.match(/^description:\s*(.+)$/m);
-    if (nameMatch && descMatch) {
-      return {
-        name: nameMatch[1].trim(),
-        description: descMatch[1].trim(),
-        location: filePath,
-      };
+    const name = parseYamlValue(yamlBlock, "name");
+    const desc = parseYamlValue(yamlBlock, "description");
+    if (name && desc) {
+      return { name, description: desc, location: filePath };
     }
-  }
-
-  // Try instructions/frontmatter block with name/description fields
-  const instNameMatch = content.match(/^---\nname:\s*(.+)$/m);
-  const instDescMatch = content.match(/^description:\s*(.+)$/m);
-  if (instNameMatch && instDescMatch) {
-    return {
-      name: instNameMatch[1].trim(),
-      description: instDescMatch[1].trim(),
-      location: filePath,
-    };
   }
 
   // Try XML-like tags in the content
@@ -397,15 +482,18 @@ function searchAllCollections(
 
 function parseSkillEntries(block: string): DiscoveredSkill[] {
   const entries: DiscoveredSkill[] = [];
-  const regex =
-    /<skill>\s*<name>(.*?)<\/name>\s*<description>(.*?)<\/description>\s*<location>(.*?)<\/location>\s*<\/skill>/gs;
-  let match;
-  while ((match = regex.exec(block)) !== null) {
-    entries.push({
-      name: match[1].trim(),
-      description: decodeXml(match[2].trim()),
-      location: match[3].trim(),
-    });
+  const skillBlocks = block.match(/<skill>([\s\S]*?)<\/skill>/g) ?? [];
+  for (const rawBlock of skillBlocks) {
+    const nameM = rawBlock.match(/<name>(.*?)<\/name>/s);
+    const descM = rawBlock.match(/<description>(.*?)<\/description>/s);
+    const locM = rawBlock.match(/<location>(.*?)<\/location>/s);
+    if (nameM && descM && locM) {
+      entries.push({
+        name: nameM[1].trim(),
+        description: decodeXml(descM[1].trim()),
+        location: locM[1].trim(),
+      });
+    }
   }
   return entries;
 }
@@ -507,8 +595,9 @@ function rewriteSkillsBlock(
   const nameSet = new Set(rankedNames);
   const filteredGlobal = allGlobalSkills.filter((s) => nameSet.has(s.name));
 
-  // Combine: project skills first, then filtered global skills
-  const combinedSkills = [...projectSkills, ...filteredGlobal];
+  // Combine: project skills first, then filtered global skills (dedup by name)
+  const projectNames = new Set(projectSkills.map((s) => s.name));
+  const combinedSkills = [...projectSkills, ...filteredGlobal.filter((s) => !projectNames.has(s.name))];
 
   if (combinedSkills.length === 0 && allGlobalSkills.length > 0) {
     notify(
@@ -522,23 +611,27 @@ function rewriteSkillsBlock(
   const newTopNSet = new Set(rankedNames.slice(0, state.config.stabilityWindow));
   const cache = state.searchCache;
   if (cache && cache.topNSet.size > 0) {
-    if (setsEqual(newTopNSet, cache.topNSet)) {
+    if (cache.skillCount !== allGlobalSkills.length) {
+      // Skill count changed — cache invalid
+    } else if (setsEqual(newTopNSet, cache.topNSet)) {
       // Rebuild prompt from cached ranked names + current system prompt
-      const cachedFiltered = allGlobalSkills.filter((s) =>
-        cache.rankedNames.includes(s.name)
+      const projectNameSet = new Set(projectSkills.map((s) => s.name));
+      const cachedFiltered = allGlobalSkills.filter(
+        (s) => cache.rankedNames.includes(s.name) && !projectNameSet.has(s.name),
       );
       const rebuiltSkills = [...projectSkills, ...cachedFiltered];
       const newBlock = buildSkillsBlock(rebuiltSkills);
-      return { newPrompt: systemPrompt.replace(fullBlock, newBlock) };
+      return { newPrompt: systemPrompt.split(fullBlock).join(newBlock) };
     }
   }
 
   const newBlock = buildSkillsBlock(combinedSkills);
-  const newPrompt = systemPrompt.replace(fullBlock, newBlock);
+  const newPrompt = systemPrompt.split(fullBlock).join(newBlock);
 
   state.searchCache = {
     rankedNames,
     topNSet: newTopNSet,
+    skillCount: allGlobalSkills.length,
   };
 
   const totalInjected = combinedSkills.length;
@@ -556,7 +649,7 @@ function rewriteSkillsBlock(
 /* ------------------------------------------------------------------ */
 
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
+  pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
     const config = loadConfig();
     const qmdOk = qmdAvailable();
     const cwd = ctx.cwd ?? process.cwd();
@@ -566,6 +659,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const collections: SkillCollection[] = [];
+    const collectionCache = new Map<string, string>();
 
     if (qmdOk) {
       for (const dir of config.skillDirectories) {
@@ -579,7 +673,7 @@ export default function (pi: ExtensionAPI) {
           continue;
         }
 
-        const res = ensureCollectionForDir(name, resolved, config);
+        const res = ensureCollectionForDir(name, resolved, config, collectionCache);
         if (res.ok) {
           collections.push({ name, dirPath: resolved });
         }
@@ -593,43 +687,30 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const cronTimer = collections.length > 0
-      ? setInterval(() => {
-          for (const coll of collections) {
-            spawnSync("qmd", ["update", coll.name], {
-              encoding: "utf-8",
-              timeout: config.qmdTimeoutMs * 2,
-            });
-          }
-        }, config.cronIntervalMs)
-      : null;
-
-    sessionMap.set(ctx, {
+    const sessionId = ctx.sessionManager.getSessionId();
+    sessionMap.set(sessionId, {
       activeCollections: collections,
       searchCache: null,
       config,
       qmdOk,
-      cronTimer,
       cwd,
+      lastAccessMs: Date.now(),
+      collectionCache,
     });
   });
 
-  pi.on("session_shutdown", async (_event: any, ctx: ExtensionContext) => {
-    const state = sessionMap.get(ctx);
-    if (state) {
-      if (state.cronTimer) {
-        clearInterval(state.cronTimer);
-      }
-      sessionMap.delete(ctx);
-    }
+  pi.on("session_shutdown", async (_event: SessionShutdownEvent, ctx: ExtensionContext) => {
+    sessionMap.delete(ctx.sessionManager.getSessionId());
   });
 
-  pi.on("before_agent_start", async (event: any, ctx: ExtensionContext) => {
+  pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
     const sp = event.systemPrompt;
     if (!sp || typeof sp !== "string") return undefined;
 
-    const state = sessionMap.get(ctx);
+    pruneSessions();
+    const state = sessionMap.get(ctx.sessionManager.getSessionId());
     if (!state) return undefined;
+    state.lastAccessMs = Date.now();
 
     const notify: NotifyFn = (msg, level) => {
       ctx.ui?.notify(msg, level);
