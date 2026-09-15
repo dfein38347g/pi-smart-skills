@@ -11,7 +11,7 @@ Single-file extension: `src/extension.ts` → re-exported by `index.ts`.
 - **Global skills** (`~/.pi/agent/skills/` by default) — filtered by QMD semantic relevance to user prompt
 - **Package skills** — auto-discovered at `session_start` by recursively scanning `~/.pi/agent/npm/node_modules/` and `~/.pi/agent/git/` for `skills/` directories containing valid `SKILL.md` files (must have YAML frontmatter with both `name` and `description`). Config templates under `configs/` are skipped. Deduplicated against `skillDirectories` by resolved realpath.
 
-**Flow:** `session_start` → load config, dynamically import QMD's store.js, open DB in-process, scan for package skill dirs, ensure collections exist via programmatic API → `before_agent_start` → discover project skills, call `structuredSearch` (lex+vec) in-process across all skill collections, rewrite `<available_skills>` block → `session_shutdown` → cleanup state.
+**Flow:** `session_start` → load config, dynamically import QMD's store.js, open DB in-process, scan for package skill dirs, ensure collections exist via programmatic API → `before_agent_start` → skip when the prompt is trivially short (estimated `< minPromptTokens` tokens, default 5 — no QMD call, system prompt unchanged), otherwise discover project skills, call `structuredSearch` (lex+vec) in-process across all skill collections, rewrite `<available_skills>` block → `session_shutdown` → cleanup state.
 
 **Session state** is keyed by `ctx.sessionManager.getSessionId()` — NOT by `ctx` object identity (pi creates a new context per event).
 
@@ -26,9 +26,10 @@ Single-file extension: `src/extension.ts` → re-exported by `index.ts`.
 
 ```bash
 npx tsc --noEmit   # typecheck — two pre-existing errors are expected (index.ts .ts extension import, missing pi types)
+node test/estimate-tokens.mjs   # checks the token estimator behind the search-trigger guard (transpiles src/extension.ts with the repo's typescript devDep)
 ```
 
-No build step, no test suite, no lint. The extension is loaded directly by pi as an ESM module.
+No build step, no lint. The extension is loaded directly by pi as an ESM module; `test/` is a plain Node script (no test runner).
 
 ## Configuration
 
@@ -40,11 +41,12 @@ Config file: `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT_DIR/pi-sma
   "promptCharLimit": 4000,
   "stabilityWindow": 5,
   "qmdTimeoutMs": 5000,
-  "skillDirectories": ["~/.pi/agent/skills"]
+  "skillDirectories": ["~/.pi/agent/skills"],
+  "minPromptTokens": 5
 }
 ```
 
-All fields optional — defaults are sensible. `qmdTimeoutMs` is retained for config backward compat but no longer used (no CLI spawns to time out). Config is merged over `DEFAULT_CONFIG` via spread. Package skill directories are discovered automatically and merged with `skillDirectories`.
+All fields optional — defaults are sensible. `minPromptTokens` is the trigger guard: user prompts estimated below that many tokens (1 per CJK/kana/hangul char, 1 per 4 other chars per whitespace chunk) skip the skills search/injection entirely. `qmdTimeoutMs` is retained for config backward compat but no longer used (no CLI spawns to time out). Config is merged over `DEFAULT_CONFIG` via spread. Package skill directories are discovered automatically and merged with `skillDirectories`.
 
 ## QMD Management
 

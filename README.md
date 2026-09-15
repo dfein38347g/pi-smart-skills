@@ -30,6 +30,8 @@ session_start
   └── Ensure QMD collections exist for all skill directories
 
 before_agent_start
+  ├── Skip (system prompt unchanged) when the prompt is trivially short
+  │   (estimated < minPromptTokens tokens — default 5: "continue", "ok", ...)
   ├── Discover project skills from <cwd>/.pi/skills/
   ├── Query QMD with user prompt against global skill collections
   ├── Combine: project skills (first) + ranked global skills
@@ -88,7 +90,8 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
   "promptCharLimit": 4000,
   "stabilityWindow": 5,
   "qmdTimeoutMs": 5000,
-  "skillDirectories": ["~/.pi/agent/skills"]
+  "skillDirectories": ["~/.pi/agent/skills"],
+  "minPromptTokens": 5
 }
 ```
 
@@ -99,6 +102,7 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
 | `stabilityWindow` | `5` | Number of top-ranked skills compared across turns for the stability cache |
 | `qmdTimeoutMs` | `5000` | Timeout (ms) for QMD CLI subprocess calls |
 | `skillDirectories` | `[~/.pi/agent/skills]` | Directories containing global skill definitions — merged with auto-discovered package dirs |
+| `minPromptTokens` | `5` | User prompts estimated below this many tokens skip the skills search/injection entirely (system prompt stays unchanged). The estimate is a dependency-free heuristic: 1 token per CJK/kana/hangul character, 1 token per 4 other characters per whitespace chunk (min 1 per chunk). |
 
 All fields are optional — config is merged over defaults via spread. Package skill directories are discovered automatically and merged with `skillDirectories` — duplicates are deduplicated by resolved path.
 

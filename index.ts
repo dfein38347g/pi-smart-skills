@@ -1,1 +1,1 @@
-export { default } from "./src/extension.ts";
+export { default, estimateTokens } from "./src/extension.ts";

@@ -56,6 +56,48 @@ function log(level: LogLevel, msg: string): void {
 }
 
 /* ------------------------------------------------------------------ */
+/* Prompt size estimation (skills-search trigger guard)                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Estimate a user prompt's token count with a dependency-free heuristic,
+ * used to decide whether the prompt is too trivial to trigger a skills
+ * search/injection (below `minPromptTokens`).
+ *
+ * Rules of thumb, deterministic and model-free:
+ *   - text splits into whitespace-separated chunks;
+ *   - CJK / kana / hangul characters count 1 token each (they are ~1
+ *     token each in modern BPE vocabularies);
+ *   - all other characters count 1 token per 4 ("4 chars ~= 1 token"
+ *     for English), with each chunk counting at least 1.
+ *
+ * Deliberately conservative for trivial messages: "continue", "ok",
+ * "yes, go ahead" all sit below the default 5-token threshold, while
+ * real instructions clear it comfortably.
+ */
+export function estimateTokens(text: string): number {
+  if (typeof text !== "string" || text.length === 0) return 0;
+  let total = 0;
+  const chunkRe = /\S+/g;
+  let match: RegExpExecArray | null;
+  while ((match = chunkRe.exec(text)) !== null) {
+    let cjk = 0;
+    let other = 0;
+    for (const ch of match[0]) {
+      const cp = ch.codePointAt(0) ?? 0;
+      const isCjk =
+        (cp >= 0x2e80 && cp <= 0x9fff) || // CJK radicals .. unified ideographs
+        (cp >= 0xac00 && cp <= 0xd7af) || // hangul syllables
+        (cp >= 0x3040 && cp <= 0x30ff); // kana
+      if (isCjk) cjk += 1;
+      else other += 1;
+    }
+    total += cjk + (other === 0 ? 0 : Math.max(1, Math.ceil(other / 4)));
+  }
+  return total;
+}
+
+/* ------------------------------------------------------------------ */
 /* Configuration                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -68,6 +110,9 @@ interface ExtensionConfig {
   qmdTimeoutMs: number;
   skillDirectories: string[];
   logLevel: string;
+  /** User prompts estimated below this many tokens skip the skills
+   *  search/injection entirely (no QMD call, system prompt unchanged). */
+  minPromptTokens: number;
 }
 
 const DEFAULT_CONFIG: ExtensionConfig = {
@@ -77,6 +122,7 @@ const DEFAULT_CONFIG: ExtensionConfig = {
   qmdTimeoutMs: 20_000,
   skillDirectories: [path.join(os.homedir(), ".pi", "agent", "skills")],
   logLevel: "warn",
+  minPromptTokens: 5,
 };
 
 function loadConfig(): ExtensionConfig {
@@ -797,7 +843,12 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const userPrompt = event.prompt ?? "";
-      log("debug",`before_agent_start: userPrompt length=${userPrompt.length}, limit=${state.config.promptCharLimit}`);
+      const promptTokens = estimateTokens(userPrompt);
+      log("debug",`before_agent_start: userPrompt length=${userPrompt.length}, ~${promptTokens} tokens, limit=${state.config.promptCharLimit}, minPromptTokens=${state.config.minPromptTokens}`);
+      if (promptTokens < state.config.minPromptTokens) {
+        log("debug",`before_agent_start: prompt has ${promptTokens} tokens (< ${state.config.minPromptTokens}) - skipping skills search/injection`);
+        return undefined;
+      }
       const result = await rewriteSkillsBlock(sp, userPrompt, state, notify);
       if (result && result.newPrompt !== sp) {
         log("debug","before_agent_start: systemPrompt rewritten successfully");
