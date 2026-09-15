@@ -1,8 +1,8 @@
 {
   "name": "pi-smart-skills",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Standalone pi extension that uses QMD hybrid search to lazily inject the most relevant skills into the system prompt",
+  "description": "Standalone pi extension that uses QMD hybrid search to lazily inject the most relevant skills — as a system-prompt rewrite (pi) or a per-turn custom message (dsh)",
   "keywords": [
     "pi-package",
     "pi",

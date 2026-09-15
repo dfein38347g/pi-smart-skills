@@ -1,1 +1,9 @@
-export { default, estimateTokens } from "./src/extension.ts";
+export {
+  default,
+  buildRelevantSkillsMessage,
+  decideInjectionMode,
+  estimateTokens,
+  listSkillsInDir,
+  resolveQmdStorePath,
+  truncateDescription,
+} from "./src/extension.ts";

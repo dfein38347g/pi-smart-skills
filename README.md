@@ -1,6 +1,6 @@
 # pi-smart-skills
 
-[pi](https://github.com/earendil-works/pi) extension that uses [QMD](https://github.com/qmd-remote/qmd) hybrid search to lazily inject the most relevant skills into the system prompt — keeping context lean while always including project-local skills.
+[pi](https://github.com/earendil-works/pi) extension that uses [QMD](https://github.com/qmd-remote/qmd) hybrid search to lazily inject the skills most relevant to the current prompt — by rewriting the `<available_skills>` block in the system prompt (pi standalone), or, in runtimes that keep their skill catalog outside the system prompt (dsh via pi2dsh publishes it as a user message), by injecting a compact "most relevant skills" custom message beside the turn's user message — keeping context lean while always including project-local skills.
 
 ## What it does
 
@@ -30,13 +30,18 @@ session_start
   └── Ensure QMD collections exist for all skill directories
 
 before_agent_start
-  ├── Skip (system prompt unchanged) when the prompt is trivially short
+  ├── Skip (prompt unchanged) when the prompt is trivially short
   │   (estimated < minPromptTokens tokens — default 5: "continue", "ok", ...)
-  ├── Discover project skills from <cwd>/.pi/skills/
-  ├── Query QMD with user prompt against global skill collections
-  ├── Combine: project skills (first) + ranked global skills
-  ├── Stability cache: skip rewrite if top-N ranked skills unchanged
-  └── Rewrite <available_skills> block in system prompt
+  ├── Decide the injection mode (injectionMode; "auto" = block present?):
+  │   ├─ rewrite: discover project skills from <cwd>/.pi/skills/,
+  │   │   query QMD with the user prompt against global skill collections,
+  │   │   combine (project skills first) + ranked global skills,
+  │   │   stability-cache the top-N, rewrite the <available_skills> block
+  │   └─ message (dsh-style runtimes): rank skills via QMD, resolve each
+  │       name to its SKILL.md name + description from disk, and return a
+  │       "most relevant skills" custom message for this turn (pi2dsh
+  │       enters it beside the user message)
+  └── Return the replacement prompt (rewrite) or the custom message
 
 session_shutdown
   └── Clean up per-session state
@@ -91,7 +96,9 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
   "stabilityWindow": 5,
   "qmdTimeoutMs": 5000,
   "skillDirectories": ["~/.pi/agent/skills"],
-  "minPromptTokens": 5
+  "minPromptTokens": 5,
+  "injectionMode": "auto",
+  "qmdStorePath": null
 }
 ```
 
@@ -103,6 +110,8 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
 | `qmdTimeoutMs` | `5000` | Timeout (ms) for QMD CLI subprocess calls |
 | `skillDirectories` | `[~/.pi/agent/skills]` | Directories containing global skill definitions — merged with auto-discovered package dirs |
 | `minPromptTokens` | `5` | User prompts estimated below this many tokens skip the skills search/injection entirely (system prompt stays unchanged). The estimate is a dependency-free heuristic: 1 token per CJK/kana/hangul character, 1 token per 4 other characters per whitespace chunk (min 1 per chunk). |
+| `injectionMode` | `"auto"` | `"auto"`: rewrite the system prompt's `<available_skills>` block when present (pi standalone); otherwise inject a "most relevant skills" custom message for the turn (dsh via pi2dsh). `"rewrite"` / `"message"` force one side. |
+| `qmdStorePath` | npm-global install | Where to import qmd's `store.js` (or its dist dir) in-process — `~` expands. Set for a profile whose runtime Node ABI differs from the machine-wide qmd build (e.g. dsh-web) to point at a per-runtime qmd copy; the `PI_SMART_SKILLS_QMD_STORE` env var overrides this. |
 
 All fields are optional — config is merged over defaults via spread. Package skill directories are discovered automatically and merged with `skillDirectories` — duplicates are deduplicated by resolved path.
 

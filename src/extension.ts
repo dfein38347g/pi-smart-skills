@@ -8,12 +8,10 @@ import * as path from "node:path";
 /* QMD runtime path                                                    */
 /* ------------------------------------------------------------------ */
 
-const QMD_STORE_PATH = path.join(
-  os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "store.js"
-);
-const QMD_COLL_PATH = path.join(
-  os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "collections.js"
-);
+// The QMD dist entry points this extension imports in-process are resolved
+// by resolveQmdStorePath() (QMD helpers section below): a profile whose
+// runtime Node ABI differs from the machine-wide global tree (e.g. dsh-web)
+// can point at a per-runtime qmd copy without touching the global install.
 
 let _qmdStore: any = null;
 let _qmdSearch: any = null;
@@ -113,6 +111,24 @@ interface ExtensionConfig {
   /** User prompts estimated below this many tokens skip the skills
    *  search/injection entirely (no QMD call, system prompt unchanged). */
   minPromptTokens: number;
+  /**
+   * In-process qmd entry to import (path to `store.js`, or its dist
+   * directory; `~` expands). Defaults to the machine-wide npm-global
+   * install. The PI_SMART_SKILLS_QMD_STORE env var overrides this. Set it
+   * for a profile whose runtime Node ABI differs from the global tree
+   * (e.g. dsh-web) to point at a per-runtime qmd copy.
+   */
+  qmdStorePath?: string;
+  /**
+   * How the filtered skill list is delivered:
+   *  - "auto" (default): rewrite the system prompt's <available_skills>
+   *    block when one is present (pi standalone); otherwise inject a
+   *    "most relevant skills" custom message for the turn (dsh, which
+   *    keeps its catalog in a user message instead of the prompt).
+   *  - "rewrite": only the original system-prompt rewrite path.
+   *  - "message": always the custom message, even when the block exists.
+   */
+  injectionMode?: "auto" | "rewrite" | "message";
 }
 
 const DEFAULT_CONFIG: ExtensionConfig = {
@@ -123,6 +139,7 @@ const DEFAULT_CONFIG: ExtensionConfig = {
   skillDirectories: [path.join(os.homedir(), ".pi", "agent", "skills")],
   logLevel: "warn",
   minPromptTokens: 5,
+  injectionMode: "auto",
 };
 
 function loadConfig(): ExtensionConfig {
@@ -164,6 +181,9 @@ interface SessionState {
   config: ExtensionConfig;
   qmdOk: boolean;
   cwd: string;
+  /** Distinct skills indexed from disk at session_start; frames the
+   *  injected message as "N of M". */
+  catalogTotal: number;
   lastAccessMs: number;
 }
 
@@ -309,10 +329,32 @@ function scanForSkillsDirs(root: string, dirs: Set<string>, depth = 0) {
 /* QMD helpers                                                        */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Resolve the qmd `store.js` entry this extension imports in-process.
+ *
+ * Precedence:
+ *   1. `envValue` (the PI_SMART_SKILLS_QMD_STORE env var when set)
+ *   2. the `qmdStorePath` config field
+ *   3. the machine-wide npm-global install
+ *
+ * The value may be the store.js path itself or its containing dist
+ * directory; `~` expands. Defaulting to the npm-global tree keeps pi
+ * standalone behavior byte-identical; a profile whose runtime Node ABI
+ * differs from the global build (e.g. dsh-web) points here at a
+ * per-runtime copy instead.
+ */
+export function resolveQmdStorePath(envValue?: string, config: Partial<ExtensionConfig> = {}): string {
+  const pick = envValue?.trim() || config.qmdStorePath?.trim() || "";
+  if (pick !== "") return expandTilde(pick);
+  return path.join(os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "store.js");
+}
+
 async function initQmdStore(): Promise<boolean> {
   try {
     if (!_qmdStore) {
-      const qmd = await import(QMD_STORE_PATH);
+      const distDir = path.dirname(resolveQmdStorePath(process.env.PI_SMART_SKILLS_QMD_STORE, loadConfig()));
+      log("debug", `initQmdStore: importing qmd from ${distDir}`);
+      const qmd = await import(path.join(distDir, "store.js"));
       if (!qmd.enableProductionMode) return false;
       qmd.enableProductionMode();
       _qmdStore = qmd.createStore();
@@ -320,14 +362,12 @@ async function initQmdStore(): Promise<boolean> {
       _removeCollection = qmd.removeCollection;
       _syncConfigToDb = qmd.syncConfigToDb;
       _reindexCollection = qmd.reindexCollection;
-      _qmdCollModule = await import(QMD_COLL_PATH);
+      _qmdCollModule = await import(path.join(distDir, "collections.js"));
       const config = _qmdCollModule.loadConfig();
       qmd.syncConfigToDb(_qmdStore.db, config);
       if (_qmdStore.db) {
-        const LLM_PATH = path.join(os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "llm.js");
-        const CFG_PATH = path.join(os.homedir(), ".npm-global", "lib", "node_modules", "@tobilu", "qmd", "dist", "configured-llm.js");
-        const { setDefaultLLM } = await import(LLM_PATH);
-        const { createConfiguredLLM } = await import(CFG_PATH);
+        const { setDefaultLLM } = await import(path.join(distDir, "llm.js"));
+        const { createConfiguredLLM } = await import(path.join(distDir, "configured-llm.js"));
         setDefaultLLM(createConfiguredLLM(config?.models, {
           embedModel: config?.models?.embed,
           generateModel: config?.models?.generate,
@@ -562,6 +602,138 @@ function parseSkillFile(content: string, filePath: string): DiscoveredSkill | nu
 }
 
 /* ------------------------------------------------------------------ */
+/* Message-based injection (runtimes without a prompt block)          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Truncate a skill description for the compact "most relevant skills"
+ * message: cut just under the limit, fall back to the last word
+ * boundary, append an ellipsis. Text at or under the limit is returned
+ * trimmed, unchanged.
+ */
+export function truncateDescription(description: string, limit = 220): string {
+  const text = description.trim();
+  if (text.length === 0) return "";
+  if (text.length <= limit) return text;
+  const cut = text.slice(0, Math.max(1, limit - 8));
+  const lastSpace = cut.lastIndexOf(" ");
+  const end = lastSpace > 0 ? lastSpace : cut.length;
+  return `${text.slice(0, end).trimEnd()}…`;
+}
+
+/**
+ * Read every skill from a skill directory (one subdirectory per skill,
+ * each holding a SKILL.md) as name + description from frontmatter.
+ * Missing directories and non-skill entries are skipped silently.
+ */
+export function listSkillsInDir(dir: string): DiscoveredSkill[] {
+  const skills: DiscoveredSkill[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return skills;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const skillMdPath = path.join(dir, entry.name, "SKILL.md");
+    let content: string;
+    try {
+      content = fs.readFileSync(skillMdPath, "utf-8");
+    } catch {
+      continue;
+    }
+    const skill = parseSkillFile(content, skillMdPath);
+    if (skill) skills.push(skill);
+  }
+  return skills;
+}
+
+/**
+ * Decide how the filtered skill list is delivered for this prompt:
+ * "rewrite" when the system prompt carries an <available_skills> block
+ * (pi standalone), "message" for runtimes that keep the catalog elsewhere
+ * (dsh: its tool-skill package publishes the catalog as a user message, so
+ * the filtered list rides in as a custom message for the turn), and
+ * null when there is no usable system prompt at all. Unknown mode values
+ * fall through to the "auto" behavior.
+ */
+export function decideInjectionMode(
+  systemPrompt: string | null | undefined,
+  mode: string,
+): "rewrite" | "message" | null {
+  if (typeof systemPrompt !== "string" || systemPrompt.length === 0) return null;
+  if (mode === "rewrite" || mode === "message") return mode;
+  return /<available_skills>[\s\S]*?<\/available_skills>/.test(systemPrompt) ? "rewrite" : "message";
+}
+
+/**
+ * Render the "most relevant skills" custom message. It mirrors the shape
+ * of dsh's skill-catalog reminder (backticked names + one-line
+ * descriptions, "call the `skill` tool with the exact name" instruction)
+ * so the model reacts the same whether the catalog arrived as a prompt
+ * block or as a message list.
+ */
+export function buildRelevantSkillsMessage(skills: DiscoveredSkill[], catalogTotal: number): string | null {
+  if (skills.length === 0) return null;
+  const lines: string[] = [
+    "<system-reminder>",
+    `Of this session's ${catalogTotal} available skills, the following ${skills.length} are most relevant to this prompt:`,
+    "",
+  ];
+  for (const skill of skills) {
+    lines.push(`- \`${skill.name}\`${skill.description ? ` ${truncateDescription(skill.description)}` : ""}`);
+  }
+  lines.push(
+    "",
+    "If a listed skill applies, call the `skill` tool with its exact name before acting; its full instructions will load into this conversation.",
+    "</system-reminder>",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Rank the skills matching a user prompt: QMD hybrid (lex+vec) search
+ * across the active collections, then resolve each matched name against
+ * the on-disk skill index for its SKILL.md name + description. Names QMD
+ * matched but that are not readable on disk are dropped, not injected —
+ * the message must never name a skill the runtime cannot load.
+ */
+async function rankSkills(
+  query: string,
+  config: ExtensionConfig,
+  collections: SkillCollection[],
+): Promise<DiscoveredSkill[]> {
+  if (!qmdAvailable()) {
+    log("warn", "rankSkills: QMD not available — skipping message injection");
+    return [];
+  }
+  const { names, error } = await searchSkills(query, config, collections);
+  if (error) {
+    log("warn", `rankSkills: QMD search ${error.kind}: ${error.detail} — skipping message injection`);
+    return [];
+  }
+  if (names.length === 0) return [];
+
+  const byName = new Map<string, DiscoveredSkill>();
+  const allDirs = [
+    ...config.skillDirectories.map((d) => expandTilde(d)),
+    ...discoverPackageSkillDirs(expandTilde("~/.pi/agent")),
+  ];
+  for (const dir of allDirs) {
+    for (const skill of listSkillsInDir(dir)) {
+      if (!byName.has(skill.name)) byName.set(skill.name, skill);
+    }
+  }
+  const resolved: DiscoveredSkill[] = [];
+  for (const name of names) {
+    const known = byName.get(name);
+    if (known) resolved.push(known);
+  }
+  return resolved;
+}
+
+/* ------------------------------------------------------------------ */
 /* System prompt rewriting                                            */
 /* ------------------------------------------------------------------ */
 
@@ -767,12 +939,27 @@ export default function (pi: ExtensionAPI) {
     const collections: SkillCollection[] = [];
     const seenPaths = new Set<string>();
 
+    // Combined directory list: config dirs + discovered npm/git package
+    // skill dirs. Hoisted above the qmdOk block: the message injection
+    // path needs the on-disk skill index even when QMD is down.
+    const allDirs = [
+      ...config.skillDirectories.map((d) => expandTilde(d, cwd)),
+      ...discoverPackageSkillDirs(agentDir),
+    ];
+
+    // Index every configured skill directory on disk (first-seen name
+    // wins). The message path attaches one-line descriptions to
+    // QMD-ranked names and frames the list as "N of M".
+    const skillIndex = new Map<string, DiscoveredSkill>();
+    for (const dir of allDirs) {
+      if (!fs.existsSync(dir)) continue;
+      for (const skill of listSkillsInDir(dir)) {
+        if (!skillIndex.has(skill.name)) skillIndex.set(skill.name, skill);
+      }
+    }
+    log("debug", `session_start: indexed ${skillIndex.size} skills from ${allDirs.length} dirs`);
+
     if (qmdOk) {
-      // Build combined directory list: config dirs + discovered npm/git package skill dirs
-      const allDirs = [
-        ...config.skillDirectories.map((d) => expandTilde(d, cwd)),
-        ...discoverPackageSkillDirs(agentDir),
-      ];
       log("debug", `session_start: scanning ${allDirs.length} directories for QMD collections`);
 
       for (const dir of allDirs) {
@@ -818,6 +1005,7 @@ export default function (pi: ExtensionAPI) {
       config,
       qmdOk,
       cwd,
+      catalogTotal: skillIndex.size,
       lastAccessMs: Date.now(),
     });
   });
@@ -849,17 +1037,40 @@ export default function (pi: ExtensionAPI) {
         log("debug",`before_agent_start: prompt has ${promptTokens} tokens (< ${state.config.minPromptTokens}) - skipping skills search/injection`);
         return undefined;
       }
-      const result = await rewriteSkillsBlock(sp, userPrompt, state, notify);
-      if (result && result.newPrompt !== sp) {
-        log("debug","before_agent_start: systemPrompt rewritten successfully");
-        return { systemPrompt: result.newPrompt };
-      } else {
+      const mode = decideInjectionMode(sp, state.config.injectionMode ?? "auto");
+      if (mode === null) return undefined;
+      log("debug", `before_agent_start: injection mode=${mode}`);
+
+      if (mode === "rewrite") {
+        const result = await rewriteSkillsBlock(sp, userPrompt, state, notify);
+        if (result && result.newPrompt !== sp) {
+          log("debug","before_agent_start: systemPrompt rewritten successfully");
+          return { systemPrompt: result.newPrompt };
+        }
         log("debug","before_agent_start: rewriteSkillsBlock returned null or unchanged prompt");
+        return undefined;
       }
+
+      // Message path (dsh-style runtimes: the catalog is a user message,
+      // not part of the system prompt). Rank skills, then inject a compact
+      // "most relevant skills" custom message beside this turn's user
+      // message — the channel pi2dsh documents for before_agent_start
+      // returns ("returned custom messages enter that same turn beside
+      // the user message").
+      const skills = await rankSkills(userPrompt, state.config, state.activeCollections);
+      if (skills.length === 0) {
+        log("debug","before_agent_start: message path: no relevant skills resolved — not injecting");
+        return undefined;
+      }
+      const text = buildRelevantSkillsMessage(skills, state.catalogTotal);
+      if (!text) return undefined;
+      log("info",`before_agent_start: injecting relevant-skills message (${skills.length} of ${state.catalogTotal}): [${skills.map((s) => s.name).join(", ")}]`);
+      notify(`[pi-smart-skills] Injected ${skills.length} relevant skill(s) for this turn`, "info");
+      return { message: { customType: "pi-smart-skills", content: text } };
     } catch (err) {
       log("debug",`before_agent_start: ERROR ${err}`);
       notify(`[pi-smart-skills] Error: ${err}`, "error");
-      return { systemPrompt: sp };
+      return undefined;
     }
     return undefined;
   });
