@@ -11,7 +11,7 @@ Single-file extension: `src/extension.ts` → re-exported by `index.ts`.
 - **Global skills** (`~/.pi/agent/skills/` by default) — filtered by QMD semantic relevance to user prompt
 - **Package skills** — auto-discovered at `session_start` by recursively scanning `~/.pi/agent/npm/node_modules/` and `~/.pi/agent/git/` for `skills/` directories containing valid `SKILL.md` files (must have YAML frontmatter with both `name` and `description`). Config templates under `configs/` are skipped. Deduplicated against `skillDirectories` by resolved realpath.
 
-**Flow:** `session_start` → load config, dynamically import QMD's store.js, open DB in-process, scan for package skill dirs, index the configured skill directories on disk (`catalogTotal` — name → SKILL.md metadata), ensure collections exist via programmatic API → `before_agent_start` → skip when the prompt is trivially short (estimated `< minPromptTokens` tokens, default 5 — no QMD call, nothing injected), otherwise decide the delivery mode per `injectionMode` — **"rewrite"** (the `"auto"` default when the prompt carries an `<available_skills>` block): discover project skills, call `structuredSearch` (lex+vec) in-process across all skill collections, stability-cache the top-N, rewrite the block; or **"message"** (dsh-style runtimes, no block in the prompt): rank the skills, resolve each name to its on-disk SKILL.md metadata, return a `{ message: { customType, content } }` custom message that the host enters into that turn → `session_shutdown` → cleanup state.
+**Flow:** `session_start` → load config, dynamically import QMD's store.js, open DB in-process, scan for package skill dirs, index the configured skill directories on disk (`catalogTotal` — name → SKILL.md metadata), ensure collections exist via programmatic API → `before_agent_start` → skip when the prompt has fewer than `minPromptWords` words (default 2 — i.e. one word or fewer, e.g. `continue`, `ok` — no QMD call, nothing injected), otherwise decide the delivery mode per `injectionMode` — **"rewrite"** (the `"auto"` default when the prompt carries an `<available_skills>` block): discover project skills, call `structuredSearch` (lex+vec) in-process across all skill collections, stability-cache the top-N, rewrite the block; or **"message"** (dsh-style runtimes, no block in the prompt): rank the skills, resolve each name to its on-disk SKILL.md metadata, return a `{ message: { customType, content } }` custom message that the host enters into that turn → `session_shutdown` → cleanup state.
 
 **Session state** is keyed by `ctx.sessionManager.getSessionId()` — NOT by `ctx` object identity (pi creates a new context per event).
 
@@ -43,13 +43,13 @@ Config file: `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT_DIR/pi-sma
   "stabilityWindow": 5,
   "qmdTimeoutMs": 5000,
   "skillDirectories": ["~/.pi/agent/skills"],
-  "minPromptTokens": 5,
+  "minPromptWords": 2,
   "injectionMode": "auto",
   "qmdStorePath": null
 }
 ```
 
-All fields optional — defaults are sensible. `minPromptTokens` is the trigger guard: user prompts estimated below that many tokens (1 per CJK/kana/hangul char, 1 per 4 other chars per whitespace chunk) skip the skills search/injection entirely. `injectionMode` (`"auto"` default) picks prompt-block rewrite (pi standalone) vs. per-turn custom message (dsh via pi2dsh); `"rewrite"`/`"message"` force either. `qmdStorePath` (or env `PI_SMART_SKILLS_QMD_STORE`) relocates the in-process qmd import for runtimes whose Node ABI differs from the global build. `qmdTimeoutMs` is retained for config backward compat but no longer used (no CLI spawns to time out). Config is merged over `DEFAULT_CONFIG` via spread. Package skill directories are discovered automatically and merged with `skillDirectories`.
+All fields optional — defaults are sensible. `minPromptWords` is the trigger guard: user prompts with fewer than that many whitespace-separated words (default 2 — one word or fewer: `continue`, `ok`) skip the skills search/injection entirely. `injectionMode` (`"auto"` default) picks prompt-block rewrite (pi standalone) vs. per-turn custom message (dsh via pi2dsh); `"rewrite"`/`"message"` force either. `qmdStorePath` (or env `PI_SMART_SKILLS_QMD_STORE`) relocates the in-process qmd import for runtimes whose Node ABI differs from the global build. `qmdTimeoutMs` is retained for config backward compat but no longer used (no CLI spawns to time out). Config is merged over `DEFAULT_CONFIG` via spread. Package skill directories are discovered automatically and merged with `skillDirectories`.
 
 ## QMD Management
 

@@ -1,6 +1,7 @@
 export {
   default,
   buildRelevantSkillsMessage,
+  countWords,
   decideInjectionMode,
   estimateTokens,
   listSkillsInDir,

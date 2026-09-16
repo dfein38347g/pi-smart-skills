@@ -58,9 +58,9 @@ function log(level: LogLevel, msg: string): void {
 /* ------------------------------------------------------------------ */
 
 /**
- * Estimate a user prompt's token count with a dependency-free heuristic,
- * used to decide whether the prompt is too trivial to trigger a skills
- * search/injection (below `minPromptTokens`).
+ * Estimate a user prompt's token count with a dependency-free heuristic.
+ * Retained as a standalone utility (exported); the actual trigger guard is
+ * the word-count check against `minPromptWords` in before_agent_start.
  *
  * Rules of thumb, deterministic and model-free:
  *   - text splits into whitespace-separated chunks;
@@ -108,9 +108,11 @@ interface ExtensionConfig {
   qmdTimeoutMs: number;
   skillDirectories: string[];
   logLevel: string;
-  /** User prompts estimated below this many tokens skip the skills
-   *  search/injection entirely (no QMD call, system prompt unchanged). */
-  minPromptTokens: number;
+  /** User prompts with fewer than this many whitespace-separated words
+   *  skip the skills search/injection entirely (no QMD call, prompt
+   *  unchanged). Default 2: one-word prompts ("continue", "ok") don't
+   *  trigger a skills pass; anything with two or more words does. */
+  minPromptWords: number;
   /**
    * In-process qmd entry to import (path to `store.js`, or its dist
    * directory; `~` expands). Defaults to the machine-wide npm-global
@@ -138,7 +140,7 @@ const DEFAULT_CONFIG: ExtensionConfig = {
   qmdTimeoutMs: 20_000,
   skillDirectories: [path.join(os.homedir(), ".pi", "agent", "skills")],
   logLevel: "warn",
-  minPromptTokens: 5,
+  minPromptWords: 2,
   injectionMode: "auto",
 };
 
@@ -601,6 +603,17 @@ function parseSkillFile(content: string, filePath: string): DiscoveredSkill | nu
   return null;
 }
 
+/**
+ * Count whitespace-separated words in a string (empty or whitespace-only
+ * strings count as zero). Drives the trigger guard: prompts with fewer
+ * than `minPromptWords` words (default 2 — i.e. one word or fewer, such
+ * as "continue" or "ok") skip the skills search/injection entirely.
+ */
+export function countWords(s: string): number {
+  const t = s.trim();
+  return t === "" ? 0 : t.split(/\s+/).length;
+}
+
 /* ------------------------------------------------------------------ */
 /* Message-based injection (runtimes without a prompt block)          */
 /* ------------------------------------------------------------------ */
@@ -1031,10 +1044,10 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const userPrompt = event.prompt ?? "";
-      const promptTokens = estimateTokens(userPrompt);
-      log("debug",`before_agent_start: userPrompt length=${userPrompt.length}, ~${promptTokens} tokens, limit=${state.config.promptCharLimit}, minPromptTokens=${state.config.minPromptTokens}`);
-      if (promptTokens < state.config.minPromptTokens) {
-        log("debug",`before_agent_start: prompt has ${promptTokens} tokens (< ${state.config.minPromptTokens}) - skipping skills search/injection`);
+      const wordCount = countWords(userPrompt);
+      log("debug",`before_agent_start: userPrompt words=${wordCount}, chars=${userPrompt.length}, limit=${state.config.promptCharLimit}, minPromptWords=${state.config.minPromptWords}`);
+      if (wordCount < state.config.minPromptWords) {
+        log("debug",`before_agent_start: prompt has ${wordCount} word(s) (< ${state.config.minPromptWords}) - skipping skills search/injection`);
         return undefined;
       }
       const mode = decideInjectionMode(sp, state.config.injectionMode ?? "auto");

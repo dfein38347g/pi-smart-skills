@@ -96,6 +96,15 @@ try {
     join(process.env.HOME, "x"),
   );
 
+  // --- countWords (trigger guard) ----------------------------------------
+
+  check("countWords: empty -> 0", mod.countWords(""), 0);
+  check("countWords: whitespace-only -> 0", mod.countWords("   \n\t "), 0);
+  check("countWords: one word", mod.countWords("continue"), 1);
+  check("countWords: CJK without spaces is one word", mod.countWords("请继续"), 1);
+  check("countWords: multiple", mod.countWords("please continue, and thank you"), 5);
+  check("countWords: spaces/tabs collapse", mod.countWords("a  b\tc"), 3);
+
   // --- decideInjectionMode -----------------------------------------------
 
   const withBlock =

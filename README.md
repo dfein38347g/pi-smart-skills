@@ -30,8 +30,8 @@ session_start
   └── Ensure QMD collections exist for all skill directories
 
 before_agent_start
-  ├── Skip (prompt unchanged) when the prompt is trivially short
-  │   (estimated < minPromptTokens tokens — default 5: "continue", "ok", ...)
+  ├── Skip (prompt unchanged) when the prompt has fewer than minPromptWords
+  │   words (default 2 — one word or fewer: "continue", "ok", ...)
   ├── Decide the injection mode (injectionMode; "auto" = block present?):
   │   ├─ rewrite: discover project skills from <cwd>/.pi/skills/,
   │   │   query QMD with the user prompt against global skill collections,
@@ -96,7 +96,7 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
   "stabilityWindow": 5,
   "qmdTimeoutMs": 5000,
   "skillDirectories": ["~/.pi/agent/skills"],
-  "minPromptTokens": 5,
+  "minPromptWords": 2,
   "injectionMode": "auto",
   "qmdStorePath": null
 }
@@ -109,7 +109,7 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
 | `stabilityWindow` | `5` | Number of top-ranked skills compared across turns for the stability cache |
 | `qmdTimeoutMs` | `5000` | Timeout (ms) for QMD CLI subprocess calls |
 | `skillDirectories` | `[~/.pi/agent/skills]` | Directories containing global skill definitions — merged with auto-discovered package dirs |
-| `minPromptTokens` | `5` | User prompts estimated below this many tokens skip the skills search/injection entirely (system prompt stays unchanged). The estimate is a dependency-free heuristic: 1 token per CJK/kana/hangul character, 1 token per 4 other characters per whitespace chunk (min 1 per chunk). |
+| `minPromptWords` | `2` | User prompts with fewer than this many whitespace-separated words skip the skills search/injection entirely (i.e. one word or fewer: "continue", "ok", …). A run of CJK text without internal spaces counts as a single word. |
 | `injectionMode` | `"auto"` | `"auto"`: rewrite the system prompt's `<available_skills>` block when present (pi standalone); otherwise inject a "most relevant skills" custom message for the turn (dsh via pi2dsh). `"rewrite"` / `"message"` force one side. |
 | `qmdStorePath` | npm-global install | Where to import qmd's `store.js` (or its dist dir) in-process — `~` expands. Set for a profile whose runtime Node ABI differs from the machine-wide qmd build (e.g. dsh-web) to point at a per-runtime qmd copy; the `PI_SMART_SKILLS_QMD_STORE` env var overrides this. |
 
