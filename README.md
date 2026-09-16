@@ -110,7 +110,7 @@ Optional config file at `~/.pi/agent/pi-smart-skills.json` (or `$PI_CODING_AGENT
 | `qmdTimeoutMs` | `5000` | Timeout (ms) for QMD CLI subprocess calls |
 | `skillDirectories` | `[~/.pi/agent/skills]` | Directories containing global skill definitions — merged with auto-discovered package dirs |
 | `minPromptWords` | `2` | User prompts with fewer than this many whitespace-separated words skip the skills search/injection entirely (i.e. one word or fewer: "continue", "ok", …). A run of CJK text without internal spaces counts as a single word. |
-| `injectionMode` | `"auto"` | `"auto"`: rewrite the system prompt's `<available_skills>` block when present (pi standalone); otherwise inject a "most relevant skills" custom message for the turn (dsh via pi2dsh). `"rewrite"` / `"message"` force one side. |
+| `injectionMode` | `"auto"` | `"auto"`: rewrite the system prompt's `<available_skills>` block when present (pi standalone); otherwise inject a "most relevant skills" custom message for the turn (dsh via pi2dsh). `"rewrite"` / `"message"` force one side. `"none"` disables all injection for that runtime (per-runtime: each runtime reads its own config file). |
 | `qmdStorePath` | npm-global install | Where to import qmd's `store.js` (or its dist dir) in-process — `~` expands. Set for a profile whose runtime Node ABI differs from the machine-wide qmd build (e.g. dsh-web) to point at a per-runtime qmd copy; the `PI_SMART_SKILLS_QMD_STORE` env var overrides this. |
 
 All fields are optional — config is merged over defaults via spread. Package skill directories are discovered automatically and merged with `skillDirectories` — duplicates are deduplicated by resolved path.

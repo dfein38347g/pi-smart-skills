@@ -129,8 +129,10 @@ interface ExtensionConfig {
    *    keeps its catalog in a user message instead of the prompt).
    *  - "rewrite": only the original system-prompt rewrite path.
    *  - "message": always the custom message, even when the block exists.
+   *  - "none": no injection at all (per-runtime opt-out; the catalog the
+   *    runtime itself publishes is untouched).
    */
-  injectionMode?: "auto" | "rewrite" | "message";
+  injectionMode?: "auto" | "rewrite" | "message" | "none";
 }
 
 const DEFAULT_CONFIG: ExtensionConfig = {
@@ -667,14 +669,16 @@ export function listSkillsInDir(dir: string): DiscoveredSkill[] {
  * "rewrite" when the system prompt carries an <available_skills> block
  * (pi standalone), "message" for runtimes that keep the catalog elsewhere
  * (dsh: its tool-skill package publishes the catalog as a user message, so
- * the filtered list rides in as a custom message for the turn), and
- * null when there is no usable system prompt at all. Unknown mode values
- * fall through to the "auto" behavior.
+ * the filtered list rides in as a custom message for the turn). The result
+ * is null for an explicit "none" mode (per-runtime opt-out) or when there
+ * is no usable system prompt at all. Unknown mode values fall through to
+ * the "auto" behavior.
  */
 export function decideInjectionMode(
   systemPrompt: string | null | undefined,
   mode: string,
 ): "rewrite" | "message" | null {
+  if (mode === "none") return null;
   if (typeof systemPrompt !== "string" || systemPrompt.length === 0) return null;
   if (mode === "rewrite" || mode === "message") return mode;
   return /<available_skills>[\s\S]*?<\/available_skills>/.test(systemPrompt) ? "rewrite" : "message";
@@ -1051,7 +1055,10 @@ export default function (pi: ExtensionAPI) {
         return undefined;
       }
       const mode = decideInjectionMode(sp, state.config.injectionMode ?? "auto");
-      if (mode === null) return undefined;
+      if (mode === null) {
+        log("debug", `before_agent_start: no injection (injectionMode=${state.config.injectionMode ?? "auto"}, systemPrompt=${typeof sp === "string" ? `${sp.length} chars` : "absent"})`);
+        return undefined;
+      }
       log("debug", `before_agent_start: injection mode=${mode}`);
 
       if (mode === "rewrite") {

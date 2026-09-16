@@ -117,6 +117,8 @@ try {
   check("decideInjectionMode: empty prompt -> null", mod.decideInjectionMode("", "auto"), null);
   check("decideInjectionMode: undefined prompt -> null", mod.decideInjectionMode(undefined, "auto"), null);
   check("decideInjectionMode: unknown mode behaves like auto", mod.decideInjectionMode(withBlock, "bogus"), "rewrite");
+  check("decideInjectionMode: none -> null even with block", mod.decideInjectionMode(withBlock, "none"), null);
+  check("decideInjectionMode: none -> null even without block", mod.decideInjectionMode(withoutBlock, "none"), null);
 
   // --- truncateDescription -----------------------------------------------
 
